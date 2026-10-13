@@ -207,6 +207,19 @@ const LANG_CONFIGS: &[LangConfig] = &[
         ],
     },
     LangConfig {
+        extensions: &[".kt", ".kts"],
+        ts_name: "kotlin",
+        definition_types: &[
+            "class_declaration",
+            "object_declaration",
+            "companion_object",
+            "function_declaration",
+            "secondary_constructor",
+            "property_declaration",
+            "type_alias",
+        ],
+    },
+    LangConfig {
         extensions: &[".sh", ".bash", ".zsh", ".ksh"],
         ts_name: "bash",
         definition_types: &["function_definition"],
@@ -612,6 +625,9 @@ static LANGUAGE_CACHE: Lazy<FxHashMap<&'static str, Language>> = Lazy::new(|| {
     #[cfg(feature = "tree-sitter-swift")]
     m.insert("swift", Language::new(tree_sitter_swift::LANGUAGE));
 
+    #[cfg(feature = "brokk-tree-sitter-kotlin")]
+    m.insert("kotlin", Language::new(brokk_tree_sitter_kotlin::LANGUAGE));
+
     #[cfg(feature = "tree-sitter-html")]
     m.insert("html", Language::new(tree_sitter_html::LANGUAGE));
 
@@ -696,6 +712,83 @@ fn get_tree_sitter_language(ts_name: &str) -> Option<Language> {
 /// as text by design (#330).
 pub fn has_grammar(path: &str) -> bool {
     find_lang_config(path).is_some_and(|c| LANGUAGE_CACHE.contains_key(c.ts_name))
+}
+
+/// How a file's grammar read it: the fragmenter records it for the bytes it
+/// parsed, so a reader asking later learns what happened rather than
+/// guessing from the fragments that came out (#454).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseOutcome {
+    Clean,
+    /// Error or missing nodes on these lines (the first few); what sits
+    /// elsewhere was read.
+    Partial(Vec<u32>),
+    TimedOut,
+}
+
+const OUTCOME_LIMIT: usize = 16_384;
+const ERROR_LINES_KEPT: usize = 3;
+
+static OUTCOMES: Lazy<std::sync::Mutex<FxHashMap<u64, ParseOutcome>>> =
+    Lazy::new(|| std::sync::Mutex::new(FxHashMap::default()));
+
+fn content_key(content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    content.hash(&mut h);
+    h.finish()
+}
+
+fn remember_outcome(content: &str, outcome: ParseOutcome) {
+    if let Ok(mut map) = OUTCOMES.lock() {
+        if map.len() >= OUTCOME_LIMIT {
+            map.clear();
+        }
+        map.insert(content_key(content), outcome);
+    }
+}
+
+fn outcome_of(tree: &Tree) -> ParseOutcome {
+    let root = tree.root_node();
+    if !root.has_error() {
+        return ParseOutcome::Clean;
+    }
+    let mut lines = Vec::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if n.is_error() || n.is_missing() {
+            lines.push(n.start_position().row as u32 + 1);
+            continue;
+        }
+        if n.has_error() {
+            let mut cursor = n.walk();
+            stack.extend(n.children(&mut cursor));
+        }
+    }
+    lines.sort_unstable();
+    lines.dedup();
+    lines.truncate(ERROR_LINES_KEPT);
+    ParseOutcome::Partial(lines)
+}
+
+/// What the file's grammar made of `content`: the fragmenter's own record
+/// of those bytes, else a parse of them. `None` without a grammar.
+pub fn parse_outcome(path: &str, content: &str) -> Option<ParseOutcome> {
+    let config = find_lang_config(path)?;
+    if !LANGUAGE_CACHE.contains_key(config.ts_name) {
+        return None;
+    }
+    if let Some(known) = OUTCOMES
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&content_key(content)).cloned())
+    {
+        return Some(known);
+    }
+    let outcome = parse_tree(config.ts_name, content)
+        .map_or(ParseOutcome::TimedOut, |tree| outcome_of(&tree));
+    remember_outcome(content, outcome.clone());
+    Some(outcome)
 }
 
 /// A parse of `content` under the named grammar, from the same thread-local
@@ -916,6 +1009,47 @@ fn first_child_def_line(node: &Node, definition_types: &[&str], depth: u32) -> O
     })
 }
 
+/// Kotlin through the fwcd grammar: names, scope and spans come from the
+/// shared Kotlin facts (`facts::kotlin`), so the fragments and every later
+/// reader of the file agree on what each declaration is called and owns.
+mod kotlin {
+    use crate::facts::kotlin as facts;
+    use tree_sitter::Node;
+
+    pub(super) fn symbol_name(node: &Node, source: &[u8]) -> Option<String> {
+        facts::declared_name(node, source)
+    }
+
+    pub(super) fn kind(node: &Node) -> Option<&'static str> {
+        match facts::declaration_kind(node)? {
+            "object" | "companion" => Some("class"),
+            "constructor" => Some("function"),
+            "interface" => Some("interface"),
+            _ => None,
+        }
+    }
+
+    /// A `val` inside a function, a lambda, an `init` block or an accessor
+    /// is a local, not a member anyone outside can reach.
+    pub(super) fn is_local_property(node: &Node) -> bool {
+        node.kind() == "property_declaration" && facts::is_local(node)
+    }
+
+    pub(super) fn end_with_accessors(node: &Node) -> u32 {
+        facts::end_with_accessors(node).0
+    }
+
+    /// A function body wraps its statements in one `statements` node.
+    pub(super) fn statements_of(body: Node) -> Node {
+        let mut cursor = body.walk();
+        let only = body.named_children(&mut cursor).collect::<Vec<_>>();
+        match only.as_slice() {
+            [single] if single.kind() == "statements" => *single,
+            _ => body,
+        }
+    }
+}
+
 /// One walk over one parse tree: the file being fragmented and what the
 /// walk has emitted so far. Every step used to thread these seven values
 /// through four mutually recursive functions.
@@ -924,6 +1058,7 @@ struct Walk<'a> {
     path: &'a Arc<str>,
     lines: &'a [&'a str],
     definition_types: &'a [&'a str],
+    kotlin: bool,
     fragments: Vec<Fragment>,
     covered: Vec<(u32, u32)>,
     added_ends: FxHashSet<(String, u32)>,
@@ -934,13 +1069,14 @@ impl<'a> Walk<'a> {
         source: &'a [u8],
         path: &'a Arc<str>,
         lines: &'a [&'a str],
-        definition_types: &'a [&'a str],
+        config: &'a LangConfig,
     ) -> Self {
         Self {
             source,
             path,
             lines,
-            definition_types,
+            definition_types: config.definition_types,
+            kotlin: config.ts_name == "kotlin",
             fragments: Vec::new(),
             covered: Vec::new(),
             added_ends: FxHashSet::default(),
@@ -977,9 +1113,12 @@ impl<'a> Walk<'a> {
         if depth > PARSERS.max_sub_depth {
             return;
         }
-        let Some(body) = find_body_node(node) else {
+        let Some(mut body) = find_body_node(node) else {
             return;
         };
+        if self.kotlin {
+            body = kotlin::statements_of(body);
+        }
 
         let named_count = body.named_child_count();
         let children: Vec<Node> = (0..named_count)
@@ -1037,16 +1176,32 @@ impl<'a> Walk<'a> {
     }
 
     fn handle_definition_node(&mut self, node: &Node, depth: u32) {
+        if self.kotlin && kotlin::is_local_property(node) {
+            self.recurse_children(node, depth);
+            return;
+        }
         let start = node_start_line(node);
-        let end = node_end_line(node);
-        let kind = node_type_to_kind(node.kind(), Some(node));
+        let end = if self.kotlin {
+            kotlin::end_with_accessors(node)
+        } else {
+            node_end_line(node)
+        };
+        let kind = if self.kotlin {
+            kotlin::kind(node).unwrap_or_else(|| node_type_to_kind(node.kind(), Some(node)))
+        } else {
+            node_type_to_kind(node.kind(), Some(node))
+        };
 
         if self.added_ends.contains(&(kind.to_string(), end)) {
             self.recurse_children(node, depth);
             return;
         }
 
-        let sym_name = extract_symbol_name(node, self.source);
+        let sym_name = if self.kotlin {
+            kotlin::symbol_name(node, self.source)
+        } else {
+            extract_symbol_name(node, self.source)
+        };
         let start = adjust_start_for_ancestor(node, start);
 
         if is_container_kind(kind)
@@ -1116,15 +1271,19 @@ impl FragmentationStrategy for TreeSitterStrategy {
             None => return Vec::new(),
         };
 
-        let tree = match parse_with_cached_parser(config.ts_name, &language, content) {
-            Some(t) => t,
-            None => return Vec::new(),
+        let Some(tree) = parse_with_cached_parser(config.ts_name, &language, content) else {
+            remember_outcome(content, ParseOutcome::TimedOut);
+            return Vec::new();
         };
+        remember_outcome(content, outcome_of(&tree));
+        if config.ts_name == "kotlin" {
+            crate::facts::kotlin::record(&tree, content);
+        }
 
         let source = content.as_bytes();
         let lines: Vec<&str> = content.split('\n').collect();
 
-        let mut walk = Walk::new(source, &path, &lines, config.definition_types);
+        let mut walk = Walk::new(source, &path, &lines, config);
         walk.extract_definitions(&tree.root_node(), 0);
         let Walk {
             mut fragments,
@@ -1285,12 +1444,7 @@ fn fragment_embedded_source(
     };
 
     let snippet_lines: Vec<&str> = snippet.split('\n').collect();
-    let mut walk = Walk::new(
-        snippet.as_bytes(),
-        path,
-        &snippet_lines,
-        config.definition_types,
-    );
+    let mut walk = Walk::new(snippet.as_bytes(), path, &snippet_lines, config);
     walk.extract_definitions(&tree.root_node(), 0);
     let embedded = walk.fragments;
 
@@ -1326,8 +1480,8 @@ mod grammar_tests {
         expected_symbol: Option<&'static str>,
     }
 
-    // One representative construct per registered grammar (LANG_CONFIGS'
-    // 37 unique ts_names). expected_kind/expected_symbol are the real,
+    // One representative construct per registered grammar (each unique
+    // LANG_CONFIGS ts_name). expected_kind/expected_symbol are the real,
     // observed extract_symbol_name/node_type_to_kind output for each
     // snippet -- this is a characterization oracle: it locks in today's
     // correct behavior so a regression in either function (e.g. dropping
@@ -1425,6 +1579,13 @@ mod grammar_tests {
         Case {
             ext: "scala",
             source: "class Foo {\n  def bar(): Int = 1\n}\n",
+            broken_tail: "class Bar {\n",
+            expected_kind: FragmentKind::Class,
+            expected_symbol: Some("Foo"),
+        },
+        Case {
+            ext: "kt",
+            source: "class Foo {\n    fun bar(): Int = 1\n}\n",
             broken_tail: "class Bar {\n",
             expected_kind: FragmentKind::Class,
             expected_symbol: Some("Foo"),
@@ -1619,6 +1780,73 @@ mod grammar_tests {
         TreeSitterStrategy::new().fragment(Arc::from(name), source)
     }
 
+    /// The fwcd Kotlin grammar names nothing by field; the adapter names
+    /// each declaration, keeps locals out, and owns what Kotlin owns.
+    #[test]
+    fn kotlin_declarations_are_named_scoped_and_owned() {
+        let body: String = (0..34).map(|i| format!("        step({i})\n")).collect();
+        let source = format!(
+            "package a\n\
+             typealias Handler = (String) -> Unit\n\
+             interface Port {{\n    fun load(id: Long): Int\n}}\n\
+             internal class Worker(val repo: Port) {{\n    val size: Int\n        get() = 1\n\
+             \n    constructor(n: Int) : this(TODO())\n\
+             \n    fun run(limit: Int = 10): Int {{\n        val local = limit\n{body}        return local\n    }}\n\
+             \n    companion object {{\n        const val MAX = 3\n    }}\n\
+             \n    private fun `weird name`() = 1\n}}\n\
+             object Covers {{\n    fun isCover(n: String) = n.isEmpty()\n}}\n\
+             fun String.pad(n: Int): String = this\n"
+        );
+        let frags = fragment_named("M.kt", &source);
+        let rows: Vec<(u32, u32, FragmentKind, Option<&str>)> = frags
+            .iter()
+            .filter(|f| f.kind != FragmentKind::Chunk || f.symbol_name.is_some())
+            .map(|f| {
+                (
+                    f.id.start_line,
+                    f.id.end_line,
+                    f.kind,
+                    f.symbol_name.as_deref(),
+                )
+            })
+            .collect();
+        let has = |kind: FragmentKind, name: &str| {
+            rows.iter()
+                .find(|r| r.2 == kind && r.3 == Some(name))
+                .copied()
+        };
+        assert!(has(FragmentKind::Type, "Handler").is_some(), "{rows:?}");
+        assert!(has(FragmentKind::Interface, "Port").is_some(), "{rows:?}");
+        assert!(has(FragmentKind::Function, "load").is_some(), "{rows:?}");
+        assert_eq!(
+            has(FragmentKind::Property, "size").map(|r| (r.0, r.1)),
+            Some((7, 8))
+        );
+        assert!(
+            has(FragmentKind::Function, "Worker").is_some(),
+            "secondary ctor: {rows:?}"
+        );
+        assert!(has(FragmentKind::Class, "Companion").is_some(), "{rows:?}");
+        assert!(has(FragmentKind::Property, "MAX").is_some(), "{rows:?}");
+        assert!(
+            has(FragmentKind::Function, "weird name").is_some(),
+            "{rows:?}"
+        );
+        assert!(has(FragmentKind::Class, "Covers").is_some(), "{rows:?}");
+        assert!(has(FragmentKind::Function, "isCover").is_some(), "{rows:?}");
+        assert!(has(FragmentKind::Function, "pad").is_some(), "{rows:?}");
+        assert!(
+            rows.iter().all(|r| r.3 != Some("local")),
+            "a local val is no member: {rows:?}"
+        );
+        let run = has(FragmentKind::Function, "run").expect("run");
+        assert!(
+            rows.iter()
+                .any(|r| r.2 == FragmentKind::Chunk && r.3.is_some_and(|s| s.starts_with("run["))),
+            "a long body is split through its statements node: {run:?} {rows:?}"
+        );
+    }
+
     #[test]
     fn representative_construct_per_grammar_reports_symbol_and_kind() {
         for case in CASES {
@@ -1732,7 +1960,6 @@ mod grammar_tests {
         "fsharp",
         "ini",
         "jinja",
-        "kotlin",
         "latex",
         "lisp",
         "markdown",

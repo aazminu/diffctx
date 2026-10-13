@@ -758,6 +758,64 @@ fn parse_symbol_query(query: &str) -> Option<(Option<&str>, Vec<&str>)> {
         .then_some((path, segments))
 }
 
+/// The files naming a symbol that this build read as text, said after "no
+/// definition found": the definition may well be in one of them, and
+/// without this the answer reads as "the name does not exist" (#454).
+fn unanalysed_namers(
+    root_dir: &Path,
+    files: &[PathBuf],
+    fragments: &[Fragment],
+    run: &crate::resource::RunContext,
+) -> String {
+    let source = run.source();
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    let mut total = 0usize;
+    for file in files {
+        let Some(rel) = rel_path_string(root_dir, file) else {
+            continue;
+        };
+        let has_definition = fragments
+            .iter()
+            .any(|f| Path::new(f.path()) == file.as_path() && f.kind.is_definition_kind());
+        let Some((reason, _)) =
+            crate::parsers::unanalysed_reason(&rel, has_definition, || source.read_bytes(file))
+        else {
+            continue;
+        };
+        let why = format!(
+            "{}{}",
+            crate::languages::get_language_for_file(&rel)
+                .map(|l| format!("{l}: "))
+                .unwrap_or_default(),
+            crate::parsers::unanalysed_text(reason)
+        );
+        total += 1;
+        match groups.iter_mut().find(|(w, _)| *w == why) {
+            Some((_, paths)) => paths.push(rel),
+            None => groups.push((why, vec![rel])),
+        }
+    }
+    if total == 0 {
+        return String::new();
+    }
+    let groups: Vec<String> = groups
+        .into_iter()
+        .map(|(why, paths)| {
+            let shown = paths.len().min(4);
+            let more = if paths.len() > shown {
+                format!(" and {} more", paths.len() - shown)
+            } else {
+                String::new()
+            };
+            format!("({why}) {}{more}", paths[..shown].join(", "))
+        })
+        .collect();
+    format!(
+        " in the analysed files; {total} file(s) naming it were read as text, so a definition or caller there is not seen: {}",
+        groups.join("; ")
+    )
+}
+
 fn resolve_symbol_change_set(
     root_dir: &Path,
     scope: &[String],
@@ -843,7 +901,25 @@ fn resolve_symbol_change_set(
                     .max_by_key(|c| c.start_line())
             })
     };
+    // Kotlin states its owners and receivers in the syntax facts: `Obj.f`,
+    // `C.Companion.f` and an extension's `String.pad` are read there, not
+    // guessed from indentation.
+    let kotlin_owned = |def: &Fragment, owner: &str| -> Option<bool> {
+        if !crate::kotlin_bindings::is_kotlin(def.path()) {
+            return None;
+        }
+        let text = run.source().read_to_string(Path::new(def.path()))?;
+        let facts = crate::facts::kotlin::facts(&text)?;
+        let decl = facts.declaration_named(def.symbol_name.as_deref()?, def.start_line())?;
+        Some(
+            decl.owners.last().map(String::as_str) == Some(owner)
+                || decl.receiver.as_deref() == Some(owner),
+        )
+    };
     let owned_by = |def: &Fragment, owner: &str| {
+        if let Some(owned) = kotlin_owned(def, owner) {
+            return owned;
+        }
         Path::new(def.path())
             .file_stem()
             .is_some_and(|stem| stem.to_string_lossy() == owner)
@@ -871,8 +947,9 @@ fn resolve_symbol_change_set(
         };
         return Err(SymbolQueryError {
             message: format!(
-                "no definition of {full:?} found{}{capped}",
-                path.map(|p| format!(" in {p}")).unwrap_or_default()
+                "no definition of {full:?} found{}{capped}{}",
+                path.map(|p| format!(" in {p}")).unwrap_or_default(),
+                unanalysed_namers(root_dir, &files, &fragments, run)
             ),
             malformed: false,
         }

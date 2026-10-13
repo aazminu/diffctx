@@ -66,6 +66,7 @@ lang-extra = [
     "tree-sitter-svelte-ng",
     "tree-sitter-scala",
     "tree-sitter-swift",
+    "brokk-tree-sitter-kotlin",
 ]
 
 [dependencies]
@@ -86,6 +87,14 @@ tree-sitter-ruby = { version = "0.23", optional = true }
 tree-sitter-php = { version = "0.24", optional = true }
 tree-sitter-scala = { version = "0.26", optional = true }
 tree-sitter-swift = { version = "0.7", optional = true }
+# The fwcd grammar (fwcd's own crate stops at 0.3.8, pinned to tree-sitter
+# < 0.23, fwcd#242), as BrokkAi publishes its maintained fork with symbol-
+# prefixed C exports. Exact pin: a fork's next release is reviewed, not taken.
+# On yay-tsa's 1,036 files it lost no type declaration and broke on none;
+# tree-sitter-kotlin-sg 0.4.1 silently dropped 7 classes (a bodyless
+# annotated class swallowed the next one) and broke 5 Compose files, and
+# tree-sitter-kotlin-ng dropped 8 and broke whole classes on `get(...)`.
+brokk-tree-sitter-kotlin = { version = "=0.4.6", optional = true }
 tree-sitter-html = { version = "0.23", optional = true }
 tree-sitter-bash = { version = "0.25", optional = true }
 tree-sitter-css = { version = "0.25", optional = true }

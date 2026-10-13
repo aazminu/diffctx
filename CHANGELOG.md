@@ -7,6 +7,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Kotlin (`.kt`, `.kts`) parses with tree-sitter, through
+  `brokk-tree-sitter-kotlin` 0.4.6 — the fwcd grammar as its maintained fork
+  publishes it, since fwcd's own crate still pins tree-sitter < 0.23. On
+  1,036 real files it lost no declaration and broke on none;
+  `tree-sitter-kotlin-sg` 0.4.1 silently dropped seven classes (a bodyless
+  annotated class swallowed the next one) and `tree-sitter-kotlin-ng` broke
+  whole classes on a `get(...)` call. Classes, interfaces, objects,
+  companions (`Companion` when unnamed), functions, extension functions,
+  secondary constructors (named after their class), properties (a property
+  spans its getter and setter; a local `val` is not a member) and type
+  aliases become fragments (#303). This reverses the 1.7.0 removal, which
+  dropped `.kt` read through the Java grammar, not a Kotlin one.
+- Kotlin has a binding model, read off shared syntax facts (one parse per
+  blob, shared by the fragmenter, `--symbol` and impact): a use binds through
+  its import or alias, the declared package (not the directory), the
+  receiver's declared type — a local, a parameter, a property of the class
+  or of a source-visible base class, a constructor or a function with a
+  written return type, called plainly or on a typed name
+  (`val x = repo.find(id)`) — an object or companion qualifier, or the
+  implicit `this`, which in an `inner class` reaches the outer instance too.
+  What the syntax cannot settle stays a candidate with its reason
+  (`receiver_unresolved`, `overloaded`, `wildcard_import`, `dispatch`,
+  `project_dependency_unknown`); `internal` stops at the project, which its
+  test source set shares. Callable references (`Obj::f`) are references,
+  implementations of a changed abstract member are their own relation, a
+  removed declaration is found by comparing the file's declarations at the
+  base and the head, and a public contract changes when the header does —
+  parameter defaults and all. In the context graph a Kotlin member use links
+  only to the definition it resolves to: a candidate suggests, it does not
+  link.
+
+### Fixed
+
+- A control statement removed from a method body is no removed member:
+  `match (a, b) {` in a Rust `impl` read as a removed API `match`, and
+  every file spelling the keyword became its caller. `when`, `try`,
+  `synchronized`, `using`, `lock`, `fixed`, `foreach` and `elseif` are
+  filtered with it (#492).
+- Impact looks a fragment id up as the fragment, not as the signature
+  variant that shares its id when the signature spans the whole fragment: a
+  Kotlin class whose header ends in `) {` answered `--symbol` with "0
+  definition(s)".
+- The JVM builder links an owner-qualified short member (`UI.DP`) to its
+  declaration. Names under three characters never linked by name, so a
+  constant read through its object was missed.
+- A JVM framework annotation registers what it annotates and nothing else:
+  a class-level `@Component` or `@Service` no longer marks every method a
+  registered entry point (which hid its missing test link); method-level
+  entry points (`@GetMapping`, `@Scheduled`, `@Bean`, …) count only when the
+  file imports them from a framework package.
+- Impact names a caller by its whole definition, not by the signature
+  variant the graph linked: a use in the body — a constructor call after a
+  long parameter list — was dropped from the caller's sites.
+- A name shared across runtimes no runtime crosses is neither a caller nor
+  a test link: a Kotlin test no longer reads as guarding a Swift function of
+  the same name, and a Kotlin or Swift spelling of a Python or TypeScript
+  name is not its caller. JVM languages still call each other, JavaScript
+  its HTML and components, Swift and Objective-C their C (#487, #458).
+- A changed symbol whose name is spelled in a file in view that did not
+  parse cleanly lists that file (`missed_in`, "callers may be missing")
+  instead of reading as one nothing calls (#454).
+- JVM tests pair with their subject the way JVM projects name them:
+  `FooTest`, `FooTests`, `FooSpec` and `FooIT` beside `Foo` are discovered
+  and linked in both directions, and `src/<set>/<java|kotlin|scala|groovy>/`
+  is a source root, so a test importing `com.acme.Foo` reaches
+  `src/main/kotlin/com/acme/Foo.kt`. A related test file is not a guard: a
+  method its tests never call keeps "no static test link".
+- `--symbol Owner.name` reads Kotlin's owners and receivers from the syntax:
+  `String.pad` names the extension, `Worker.Companion.create` the companion
+  member; and the declaration search that keeps a capped query's definition
+  file knows `fun` and `typealias`.
+- A Kotlin type the text declares at the start of a line but the parse did
+  not read — a grammar's silent misreading, with no error node — marks the
+  file analysed only in part (0 of yay-tsa's 1,036 files with the shipped
+  grammar; local classes count as read).
+- The parse outcome is recorded when the fragmenter parses a file, not
+  inferred from the fragments that came out: a file that parsed with errors
+  is reported as analysed only in part even when a definition survived, and
+  a timed-out parse is named as such.
+
+- Impact names the changed code files it could not read for definitions —
+  no grammar for the language in this build, or a parse that broke — in its
+  header and in `unanalysed_files`, and never calls such a change empty: a
+  Kotlin-only commit read "0 callers outside the diff" and the commit hook
+  stayed silent (#454). A script that parses cleanly and defines nothing is
+  not listed.
+- `--symbol` no longer answers only "no definition found" when the files
+  naming the symbol were read as text: it names them and the reason, so an
+  unparsed definition is not mistaken for a missing one (#454).
+- Locate's `unparsed_files` uses the same test: code with no grammar in this
+  build (Kotlin, F#, Fortran) or a broken parse is listed and lowers
+  confidence; a script that parses cleanly and defines nothing (a
+  `build.gradle.kts`, a Python script of top-level statements) no longer is.
+  Data files (`.sql`, `.toml`, `.txt`) stay unlisted (#330).
+
+### Changed
+
+- Claude plugin: the MCP server and the hooks launch `uvx diffctx[mcp]==X`
+  with no other option, and `plugin/uv.lock` pins the release's whole
+  dependency tree with PyPI hashes, the shape the plugin directory reads as a
+  locked launch ("Launcher lock invalid" before). `constraints.txt` is gone:
+  uv resolves diffctx's dependencies within their declared ranges, as every
+  other uvx install already did.
+- CI and the pre-commit hook run the `impact`, `hook`, `bindings`, `staged`,
+  `git_faults`, `in_memory` and `context_schema` test targets, which no gate
+  ran before.
+
 ## [1.18.4] - 2026-10-07
 
 ### Security

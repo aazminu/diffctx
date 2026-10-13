@@ -27,6 +27,45 @@ static STRATEGIES: Lazy<Vec<Box<dyn FragmentationStrategy>>> = Lazy::new(|| {
 
 pub(crate) use tree_sitter_strategy::{has_grammar, parse_tree};
 
+pub use tree_sitter_strategy::ParseOutcome;
+
+/// Why a code file's definitions were not all read (#454): `no_grammar` when
+/// this build has no grammar for its language, `parse_timeout` when the
+/// parse ran out of time, `parse_failed` when it broke and no definition came
+/// out, `parse_partial` when it broke on some lines and the rest was read.
+/// `None` for a clean parse, a definition-free script included, and for
+/// prose, config and data, which have no definitions to miss.
+pub fn unanalysed_reason(
+    path: &str,
+    has_definition: bool,
+    content: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<(&'static str, Vec<u32>)> {
+    let ext = crate::edges::base::file_ext(std::path::Path::new(path));
+    if !crate::config::extensions::CODE_EXTENSIONS.contains(ext.as_str()) {
+        return None;
+    }
+    if !has_grammar(path) {
+        return Some(("no_grammar", Vec::new()));
+    }
+    let content = content()?;
+    match tree_sitter_strategy::parse_outcome(path, &String::from_utf8_lossy(&content))? {
+        ParseOutcome::Clean => None,
+        ParseOutcome::TimedOut => Some(("parse_timeout", Vec::new())),
+        ParseOutcome::Partial(lines) if has_definition => Some(("parse_partial", lines)),
+        ParseOutcome::Partial(lines) => Some(("parse_failed", lines)),
+    }
+}
+
+/// How a reason of `unanalysed_reason` reads in prose.
+pub fn unanalysed_text(reason: &str) -> &'static str {
+    match reason {
+        "no_grammar" => "no grammar in this build",
+        "parse_timeout" => "parse timed out",
+        "parse_partial" => "parsed with errors",
+        _ => "parse failed",
+    }
+}
+
 pub fn fragment_file(path: Arc<str>, content: &str) -> Vec<Fragment> {
     for strategy in STRATEGIES.iter() {
         if strategy.can_handle(&path, content) {

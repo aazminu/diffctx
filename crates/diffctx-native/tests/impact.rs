@@ -1260,6 +1260,38 @@ fn a_deleted_call_inside_a_method_is_no_removed_member() {
     assert!(contract_symbols(&doc).is_empty(), "{doc:#}");
 }
 
+/// A control statement removed from a method body declares nothing:
+/// `match (a, b) {` inside a Rust `impl` read as a removed member `match`,
+/// and every file spelling the keyword became its caller.
+#[test]
+fn a_removed_control_statement_is_no_removed_member() {
+    let shape = |body: &str| {
+        format!(
+            "pub struct Shape;\n\nimpl Shape {{\n    pub fn area(&self, a: u32, b: u32) -> u32 {{\n{body}        a * b\n    }}\n}}\n"
+        )
+    };
+    let tmp = repo_of(
+        &[
+            (
+                "src/shape.rs",
+                &shape(
+                    "        match (a, b) {\n            (0, _) => return 0,\n            _ => {}\n        }\n",
+                ),
+            ),
+            (
+                "src/other.rs",
+                "pub fn pick(x: u32) -> u32 {\n    match (x, 1) {\n        (0, _) => 0,\n        _ => 1,\n    }\n}\n",
+            ),
+        ],
+        &[("src/shape.rs", &shape(""))],
+    );
+    let doc = impact(tmp.path(), "HEAD~1..HEAD");
+    assert!(
+        !changed_symbols(&doc).contains(&"match".to_string()),
+        "{doc:#}"
+    );
+}
+
 /// Deleting the function right under a caller leaves that caller outside
 /// the diff: a pure removal is anchored on the line above it.
 #[test]
@@ -2280,39 +2312,54 @@ fn a_deletion_below_a_definition_does_not_change_it() {
 /// not tests: a lexical test link stops at the project a manifest marks.
 #[test]
 fn a_sibling_project_s_test_does_not_guard_a_caller() {
+    // One runtime with no binding model, so the link is the lexical one the
+    // manifest stop governs (a test in another runtime links nothing, #487).
+    // `quiz` names its own `Config`, never importing `web.Config`.
     let files = |root_manifest: bool| {
         let mut f = vec![
-            ("web/package.json", "{\"name\": \"web\"}\n"),
             (
-                "web/src/contracts.ts",
-                "export const CONTRACTS = { theme: 'dark' };\n",
+                "web/pom.xml",
+                "<project><artifactId>web</artifactId></project>\n",
             ),
             (
-                "web/src/config.ts",
-                "import { CONTRACTS } from './contracts';\n\nexport function generated(): string {\n  return CONTRACTS.theme;\n}\n",
+                "web/src/main/java/web/Contracts.java",
+                "package web;\n\npublic class Contracts {\n    public static String theme() {\n        return \"dark\";\n    }\n}\n",
             ),
             (
-                "quiz/tests/conftest.py",
-                "import config\n\nCONTRACTS = {}\n\n\ndef test_generated():\n    assert config.generated() == CONTRACTS\n",
+                "web/src/main/java/web/Config.java",
+                "package web;\n\npublic class Config {\n    public static String generated() {\n        return Contracts.theme();\n    }\n}\n",
+            ),
+            (
+                "quiz/src/test/java/quiz/ConfigTest.java",
+                "package quiz;\n\npublic class ConfigTest {\n    public void testGenerated() {\n        assert Config.generated().equals(\"dark\");\n    }\n}\n",
             ),
         ];
         if root_manifest {
-            f.push(("quiz/pyproject.toml", "[project]\nname = \"quiz\"\n"));
+            f.push((
+                "quiz/pom.xml",
+                "<project><artifactId>quiz</artifactId></project>\n",
+            ));
         }
         f
     };
     let change = [(
-        "web/src/contracts.ts",
-        "export const CONTRACTS = { theme: 'light' };\n",
+        "web/src/main/java/web/Contracts.java",
+        "package web;\n\npublic class Contracts {\n    public static String theme() {\n        return \"light\";\n    }\n}\n",
     )];
     // One project: the lexical link stands, so the probe below is not vacuous.
     let together = repo_of(&files(false), &change);
     let md = impact_markdown(together.path(), "HEAD~1..HEAD");
-    assert!(md.contains("quiz/tests/conftest.py"), "{md}");
+    assert!(
+        md.contains("quiz/src/test/java/quiz/ConfigTest.java"),
+        "{md}"
+    );
     let apart = repo_of(&files(true), &change);
     let md = impact_markdown(apart.path(), "HEAD~1..HEAD");
-    assert!(md.contains("web/src/config.ts::generated"), "{md}");
-    assert!(!md.contains("quiz/tests/conftest.py"), "{md}");
+    assert!(
+        md.contains("web/src/main/java/web/Config.java::generated"),
+        "{md}"
+    );
+    assert!(!md.contains("ConfigTest.java"), "{md}");
 }
 
 /// A sibling module of one language that imports the definition by its
@@ -2440,5 +2487,189 @@ fn local_functions_and_untyped_attribute_reads_are_not_callers() {
     assert!(
         md.contains("client.py::fetch"),
         "an untyped call stays possible: {md}"
+    );
+}
+
+/// #454: a change this build cannot read for definitions — no grammar for
+/// its language, or a parse that broke — is named as not analysed, and the
+/// answer is never the all-clear a hook stays silent on. A script that
+/// parses cleanly and defines nothing is analysed: there was nothing to miss.
+#[test]
+fn a_code_change_without_a_parse_is_not_analysed_not_an_all_clear() {
+    let solver = |k: &str| {
+        format!(
+            "module solver\ncontains\n  subroutine step(x)\n    real :: x\n    x = x * {k}\n  end subroutine step\nend module solver\n"
+        )
+    };
+    let tmp = repo_of(
+        &[
+            ("num/solver.f90", &solver("2.0")),
+            ("tools/run.py", "print(\"run\")\n"),
+            ("tools/broken.py", "value = (1,\n"),
+            ("tools/gone.f90", "program gone\nend program gone\n"),
+        ],
+        &[
+            ("num/solver.f90", &solver("3.0")),
+            ("tools/run.py", "print(\"run again\")\n"),
+            ("tools/broken.py", "value = (2,\n"),
+        ],
+    );
+    git(tmp.path(), &["rm", "-q", "tools/gone.f90"]);
+    commit_all(tmp.path(), "drop gone");
+    let doc = impact(tmp.path(), "HEAD~2..HEAD");
+    assert_eq!(doc["empty"], false, "{doc}");
+    let unanalysed: Vec<(String, String)> = doc["unanalysed_files"]
+        .as_array()
+        .expect("unanalysed_files")
+        .iter()
+        .map(|f| {
+            (
+                f["path"].as_str().unwrap().to_string(),
+                f["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        unanalysed,
+        vec![
+            ("num/solver.f90".to_string(), "no_grammar".to_string()),
+            ("tools/broken.py".to_string(), "parse_failed".to_string()),
+        ],
+        "{doc}"
+    );
+    let md = impact_markdown(tmp.path(), "HEAD~2..HEAD");
+    assert!(header(&md).contains("2 not analysed"), "{md}");
+    assert!(header(&md).contains("in the analysed files"), "{md}");
+    assert!(
+        md.contains("1 fortran (no grammar in this build): num/solver.f90"),
+        "{md}"
+    );
+    assert!(
+        md.contains("1 python (parse failed): tools/broken.py"),
+        "{md}"
+    );
+    assert!(!md.contains("No resolved static callers"), "{md}");
+}
+
+/// #454: "no definition found" reads as "the name does not exist". When the
+/// only files naming it were read as text, the answer says which and why;
+/// a name nobody spells keeps the plain answer.
+#[test]
+fn a_symbol_named_only_in_unparsed_files_is_not_said_to_be_missing() {
+    let tmp = repo_of(
+        &[
+            (
+                "num/solver.f90",
+                "module solver\ncontains\n  subroutine relax_step(x)\n    real :: x\n  end subroutine relax_step\nend module solver\n",
+            ),
+            (
+                "num/use.f90",
+                "program use\n  call relax_step(1.0)\nend program use\n",
+            ),
+            ("app.py", "def main():\n    return 1\n"),
+        ],
+        &[],
+    );
+    let symbol = |name: &str| {
+        Command::new(&*BIN)
+            .current_dir(tmp.path())
+            .args(["--symbol", name, "-q", "-f", "md"])
+            .output()
+            .expect("run diffctx")
+    };
+    let unparsed = symbol("relax_step");
+    assert!(!unparsed.status.success());
+    let err = String::from_utf8_lossy(&unparsed.stderr);
+    assert!(
+        err.contains("2 file(s) naming it were read as text"),
+        "{err}"
+    );
+    assert!(err.contains("fortran: no grammar in this build"), "{err}");
+    assert!(
+        err.contains("num/solver.f90") && err.contains("num/use.f90"),
+        "{err}"
+    );
+
+    let missing = symbol("nowhere_spelled");
+    let err = String::from_utf8_lossy(&missing.stderr);
+    assert!(err.contains("no definition"), "{err}");
+    assert!(!err.contains("read as text"), "{err}");
+}
+
+/// A Kotlin class whose header is exactly its signature — a multi-line
+/// primary constructor ending `) {` — shares its id with the signature
+/// variant; the definition is still the class, with its callers.
+#[test]
+fn a_class_whose_header_is_its_signature_keeps_its_definition() {
+    let tmp = repo_of(
+        &[
+            (
+                "src/main/kotlin/a/Turns.kt",
+                "package a\n\nclass Turns(\n    private val api: String,\n    private val namespace: String,\n    private val token: () -> String,\n    private val poll: Long = 10,\n) {\n    fun turn(): Boolean = true\n}\n",
+            ),
+            (
+                "src/main/kotlin/a/User.kt",
+                "package a\n\nclass User {\n    fun make() = Turns(\"x\", \"y\", { \"t\" })\n}\n",
+            ),
+        ],
+        &[],
+    );
+    let out = Command::new(&*BIN)
+        .current_dir(tmp.path())
+        .args(["--symbol", "Turns", "-q", "-f", "md"])
+        .output()
+        .expect("run diffctx");
+    let md = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(header(&md).contains("1 definition(s)"), "{md}");
+    assert!(md.contains("Turns.kt::Turns (3-8)"), "{md}");
+    assert!(md.contains("User.kt::make"), "{md}");
+}
+
+/// #487: no runtime crosses from Kotlin to Swift. A Swift function that
+/// shares a name with the Kotlin client's is not reachable from the Kotlin
+/// test that reaches the Kotlin one.
+#[test]
+fn a_test_in_another_runtime_does_not_guard_a_namesake() {
+    let tmp = repo_of(
+        &[
+            (
+                "android/app/src/main/java/a/ApiClient.kt",
+                "package a\n\ndata class UserPreferences(val theme: String)\n\nclass ApiClient {\n    fun fetchUserPreferences(): UserPreferences = UserPreferences(\"dark\")\n}\n",
+            ),
+            (
+                "ios/Sources/APIClient.swift",
+                "import Foundation\n\nstruct UserPreferences {\n    let theme: String\n}\n\nclass APIClient {\n    func fetchUserPreferences() -> UserPreferences {\n        return UserPreferences(theme: \"dark\")\n    }\n}\n",
+            ),
+            (
+                "android/app/src/test/java/a/ApiClientAdminTest.kt",
+                "package a\n\nclass ApiClientAdminTest {\n    fun prefs() {\n        val apiClient = ApiClient()\n        check(apiClient.fetchUserPreferences().theme == \"dark\")\n    }\n}\n",
+            ),
+        ],
+        &[],
+    );
+    let out = Command::new(&*BIN)
+        .current_dir(tmp.path())
+        .args(["--symbol", "UserPreferences", "-q", "-f", "md"])
+        .output()
+        .expect("run diffctx");
+    let md = String::from_utf8_lossy(&out.stdout);
+    let line = |path: &str| {
+        md.lines()
+            .find(|l| l.contains(path) && l.contains("fetchUserPreferences"))
+            .unwrap_or_else(|| panic!("{path}: {md}"))
+            .to_string()
+    };
+    assert!(
+        line("ApiClient.kt").contains("ApiClientAdminTest.kt"),
+        "{md}"
+    );
+    assert!(
+        !line("APIClient.swift").contains("ApiClientAdminTest"),
+        "{md}"
     );
 }

@@ -72,6 +72,9 @@ static SCALA_CLASS_RE: Lazy<Regex> = Lazy::new(|| {
 static TYPE_REF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b([A-Z]\w*)\b").unwrap());
 static ANNOTATION_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"@([A-Z]\w*)").unwrap());
 static MEMBER_USE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\.\s*([a-zA-Z_]\w{2,})").unwrap());
+/// `UI.DP`: a member too short for the bare channel, spelled with its owner.
+static QUALIFIED_SHORT_USE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b([A-Z]\w*)\s*\.\s*([A-Za-z_]\w?)\b").unwrap());
 static KOTLIN_EXTENDS_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?:class|interface|object)\s+\w+(?:<[^>]*>)?(?:\([^)]*\))?\s*:\s*([^{]+)").unwrap()
 });
@@ -392,6 +395,28 @@ fn is_member_def(f: &Fragment) -> bool {
     matches!(f.kind, FragmentKind::Function | FragmentKind::Property)
 }
 
+/// The container a member is declared in: the nearest container above it at
+/// a shallower indent, since a split class keeps only its header fragment.
+fn owner_of<'a>(member: &Fragment, frags: &[&'a Fragment]) -> Option<&'a str> {
+    let indent = |f: &Fragment| {
+        f.content
+            .lines()
+            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('@'))
+            .map_or(0, |l| l.len() - l.trim_start().len())
+    };
+    let own = indent(member);
+    frags
+        .iter()
+        .filter(|c| {
+            c.kind.is_container()
+                && c.path() == member.path()
+                && c.start_line() < member.start_line()
+                && indent(c) < own
+        })
+        .max_by_key(|c| c.start_line())
+        .and_then(|c| c.symbol_name.as_deref())
+}
+
 struct FileRelations<'a> {
     file_pkg: FxHashMap<&'a str, String>,
     import_files: FxHashMap<&'a str, FxHashSet<&'a str>>,
@@ -463,11 +488,12 @@ impl<'a> FileRelations<'a> {
 pub struct JVMEdgeBuilder;
 
 impl EdgeBuilder for JVMEdgeBuilder {
-    fn build(&self, fragments: &[Fragment], _repo_root: Option<&Path>) -> EdgeDict {
+    fn build(&self, fragments: &[Fragment], repo_root: Option<&Path>) -> EdgeDict {
         let Some(jvm_frags) = base::frags_where(fragments, |f| is_jvm_file(Path::new(f.path())))
         else {
             return FxHashMap::default();
         };
+        let source = crate::source::current();
 
         let import_weight = EDGE_WEIGHTS["jvm_import"].forward;
         let inheritance_weight = EDGE_WEIGHTS["jvm_inheritance"].forward;
@@ -490,6 +516,10 @@ impl EdgeBuilder for JVMEdgeBuilder {
         let mut fqn_to_frags: FxHashMap<String, Vec<FragmentId>> = FxHashMap::default();
         let mut member_defs: FxHashMap<String, Vec<FragmentId>> = FxHashMap::default();
         let mut member_def_files: FxHashMap<String, FxHashSet<&str>> = FxHashMap::default();
+        // Members whose name is too short to link by name alone, keyed by
+        // the container they are declared in: `object UI { const val DP }`.
+        let mut owned_short_members: FxHashMap<(String, String), Vec<FragmentId>> =
+            FxHashMap::default();
 
         for f in &jvm_frags {
             let path = Path::new(f.path());
@@ -512,7 +542,14 @@ impl EdgeBuilder for JVMEdgeBuilder {
             }
             if is_member_def(f) {
                 if let Some(name) = f.symbol_name.as_deref() {
-                    if name.len() >= 3 {
+                    if name.len() < 3 && !is_kotlin(path) {
+                        if let Some(owner) = owner_of(f, &jvm_frags) {
+                            owned_short_members
+                                .entry((owner.to_string(), name.to_string()))
+                                .or_default()
+                                .push(f.id.clone());
+                        }
+                    } else if name.len() >= 3 {
                         let lower = name.to_lowercase();
                         member_defs
                             .entry(lower.clone())
@@ -729,7 +766,83 @@ impl EdgeBuilder for JVMEdgeBuilder {
             }
         }
 
+        // Kotlin users bind through their syntax facts: a member use links to
+        // the definitions the Kotlin binding model resolves it to, whatever
+        // the length of the name. A candidate (an untyped receiver, an
+        // overload) is no edge — a guess suggests, it does not link — and a
+        // spelling in a string or a comment links nothing.
+        let kotlin_defs: FxHashMap<&str, Vec<&Fragment>> = {
+            let mut m: FxHashMap<&str, Vec<&Fragment>> = FxHashMap::default();
+            for f in jvm_frags.iter().filter(|f| is_kotlin(Path::new(f.path()))) {
+                if let Some(name) = f
+                    .symbol_name
+                    .as_deref()
+                    .filter(|_| f.kind.is_definition_kind())
+                {
+                    m.entry(name).or_default().push(f);
+                }
+            }
+            m
+        };
+        if let Some(root) = repo_root.filter(|_| !kotlin_defs.is_empty()) {
+            let resolver = crate::kotlin_bindings::KotlinResolver::new(root, &source);
+            let rel = |p: &str| {
+                Path::new(p)
+                    .strip_prefix(root)
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| p.to_string())
+            };
+            let mut defs_of: FxHashMap<&FragmentId, Option<crate::kotlin_bindings::KDef>> =
+                FxHashMap::default();
+            for jf in jvm_frags.iter().filter(|f| is_kotlin(Path::new(f.path()))) {
+                let user = rel(jf.path());
+                let Some(facts) = resolver.facts(&user) else {
+                    continue;
+                };
+                let first = facts.uses.partition_point(|u| u.line < jf.start_line());
+                let mut names: Vec<&str> = facts.uses[first..]
+                    .iter()
+                    .take_while(|u| u.line <= jf.end_line())
+                    .map(|u| u.name.as_str())
+                    .collect();
+                names.sort_unstable();
+                names.dedup();
+                for name in names {
+                    let Some(defs) = kotlin_defs.get(name) else {
+                        continue;
+                    };
+                    let files: FxHashSet<&str> = defs.iter().map(|d| d.path()).collect();
+                    if files.len() > MAX_FILES_PER_NAME {
+                        continue;
+                    }
+                    for d in defs {
+                        if d.id == jf.id || crate::container::within(&jf.id, d) {
+                            continue;
+                        }
+                        let Some(def) = defs_of
+                            .entry(&d.id)
+                            .or_insert_with(|| {
+                                resolver.definition(&rel(d.path()), name, d.start_line())
+                            })
+                            .as_ref()
+                        else {
+                            continue;
+                        };
+                        if resolver
+                            .classify(&user, (jf.start_line(), jf.end_line()), def)
+                            .is_some_and(|f| f.evidence == crate::bindings::Evidence::Resolved)
+                        {
+                            add_edge(&mut edges, &jf.id, &d.id, member_weight, reverse_factor);
+                        }
+                    }
+                }
+            }
+        }
+
         for jf in &jvm_frags {
+            if is_kotlin(Path::new(jf.path())) {
+                continue;
+            }
             let own = jf.symbol_name.as_deref().map(|s| s.to_lowercase());
             for m in extract_member_uses(&jf.content) {
                 if own.as_deref() == Some(m.as_str()) {
@@ -750,6 +863,14 @@ impl EdgeBuilder for JVMEdgeBuilder {
                         continue;
                     }
                     if rel.confirmed(jf.path(), dst_path) {
+                        add_edge(&mut edges, &jf.id, d, member_weight, reverse_factor);
+                    }
+                }
+            }
+            for cap in QUALIFIED_SHORT_USE_RE.captures_iter(&jf.content) {
+                let key = (cap[1].to_string(), cap[2].to_string());
+                for d in owned_short_members.get(&key).into_iter().flatten() {
+                    if d.path.as_ref() != jf.path() && rel.confirmed(jf.path(), d.path.as_ref()) {
                         add_edge(&mut edges, &jf.id, d, member_weight, reverse_factor);
                     }
                 }

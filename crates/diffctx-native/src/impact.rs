@@ -8,7 +8,9 @@ use serde::Serialize;
 
 use crate::bindings::{self, Definition, Evidence, Finding, Relation, Resolver, Site};
 use crate::container::{innermost, named_container_of, within};
+use crate::facts::kotlin::Visibility as KVisibility;
 use crate::graph::EdgeCategory;
+use crate::kotlin_bindings::{KDef, KotlinResolver, is_kotlin};
 use crate::pipeline::ScoredState;
 use crate::types::{Fragment, FragmentId, FragmentKind};
 
@@ -40,6 +42,10 @@ const CALLER_LOSING_LIMITS: &[crate::resource::LimitReason] = &[
 ];
 /// Paths listed before the rest fold into a count: the reader has the diff.
 const MAX_CHANGED_FILES_LISTED: usize = 24;
+/// Unanalysed files kept when the answer must shrink; the rest are counted.
+const MAX_UNANALYSED_LISTED: usize = 6;
+/// Unanalysed paths the text names per language; the reader holds the diff.
+const UNANALYSED_EXAMPLES: usize = 2;
 
 /// A symbol name with more definitions than this cannot be traced by name.
 const MAX_DEFINITIONS: usize = 2;
@@ -138,6 +144,13 @@ pub struct ImpactOutput {
     /// (#392).
     #[serde(default, skip_serializing_if = "crate::render::is_zero")]
     pub withheld_files: usize,
+    /// Changed code files whose definitions were not read — no grammar for
+    /// the language in this build, or a parse that failed — so their callers
+    /// and contracts are not counted, and `empty` is never claimed (#454).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unanalysed_files: Vec<UnanalysedFile>,
+    #[serde(default, skip_serializing_if = "crate::render::is_zero")]
+    pub unanalysed_files_omitted: usize,
     /// The token cap the answer was fitted to.
     #[serde(skip)]
     #[schemars(skip)]
@@ -168,6 +181,11 @@ pub struct ChangedSymbol {
     /// parameters with defaults, so they are counted, not listed (#388).
     #[serde(default, skip_serializing_if = "crate::render::is_zero")]
     pub compatible_callers: usize,
+    /// Files in view that spell the name but were not fully analysed: a
+    /// caller there is not seen, so an empty `callers` says nothing about
+    /// them (#454).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missed_in: Vec<UnanalysedFile>,
 }
 
 #[derive(Serialize, JsonSchema, Clone)]
@@ -222,6 +240,19 @@ pub struct StaleReference {
     pub target: String,
     /// `deleted`, or `renamed to <new path>`.
     pub kind: String,
+}
+
+#[derive(Serialize, JsonSchema, Clone)]
+pub struct UnanalysedFile {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<&'static str>,
+    /// `no_grammar`, `parse_timeout`, `parse_failed` (nothing read), or
+    /// `parse_partial` (read but for the error lines).
+    pub reason: &'static str,
+    /// Where the parse broke, the first few lines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<u32>,
 }
 
 #[derive(Serialize, JsonSchema, Clone)]
@@ -621,6 +652,95 @@ fn is_import_block(content: &str) -> bool {
         }
     }
     !saw_code
+}
+
+/// The changed code files whose definitions this run did not read (#454),
+/// ordered by language then path so the listed ones and the counted rest are
+/// stable.
+fn unanalysed_files(state: &ScoredState, changed: &[String]) -> Vec<UnanalysedFile> {
+    let mut fragmented: FxHashMap<String, bool> = FxHashMap::default();
+    for f in &state.all_fragments {
+        *fragmented.entry(rel(state, f.path())).or_default() |= f.kind.is_definition_kind();
+    }
+    let source = state.run.source();
+    let mut out: Vec<UnanalysedFile> = changed
+        .iter()
+        .filter_map(|path| {
+            // No fragment at all: deleted, withheld or never read, which the
+            // answer already says another way.
+            let has_definition = *fragmented.get(path)?;
+            let (reason, lines) = crate::parsers::unanalysed_reason(path, has_definition, || {
+                source.read_bytes(&state.root_dir.join(path))
+            })?;
+            Some(UnanalysedFile {
+                path: path.clone(),
+                language: crate::languages::get_language_for_file(path),
+                reason,
+                lines,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.language
+            .cmp(&b.language)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    out
+}
+
+/// Files in view, other than the definition's own, that spell `name` but
+/// whose definitions were not all read: a caller there is not seen.
+fn missed_namers(state: &ScoredState, files: &Files, name: &str, own: &str) -> Vec<UnanalysedFile> {
+    let source = state.run.source();
+    let mut out: Vec<UnanalysedFile> = files
+        .identifiers
+        .iter()
+        .filter(|(path, words)| **path != own && words.contains(name))
+        .filter_map(|(path, _)| {
+            let rel_path = rel(state, path);
+            let has_definition = files
+                .fragments
+                .get(path)
+                .is_some_and(|frags| frags.iter().any(|f| f.kind.is_definition_kind()));
+            let (reason, lines) =
+                crate::parsers::unanalysed_reason(&rel_path, has_definition, || {
+                    source.read_bytes(Path::new(path))
+                })?;
+            Some(UnanalysedFile {
+                language: crate::languages::get_language_for_file(&rel_path),
+                path: rel_path,
+                reason,
+                lines,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// The runtime a language runs in, for the languages that call across
+/// their own boundary: JVM languages call each other, JavaScript runs the
+/// HTML and single-file components that embed it, Swift, Objective-C, C and
+/// C++ bridge and link. Anything else is its own runtime.
+fn runtime_of(path: &str) -> String {
+    let language = crate::languages::get_language_for_file(path).unwrap_or("");
+    match language {
+        "java" | "kotlin" | "scala" | "groovy" | "clojure" => "jvm",
+        "javascript" | "typescript" | "tsx" | "jsx" | "html" | "svelte" | "vue" => "js",
+        "python" | "cython" => "python",
+        "csharp" | "c_sharp" | "fsharp" => "dotnet",
+        "swift" | "objectivec" | "c" | "cpp" => "native",
+        other => other,
+    }
+    .to_string()
+}
+
+/// No runtime crosses from one to the other: a Kotlin test cannot run a
+/// Swift function, and a Python name in a Kotlin file is not a call of it
+/// (#458, #487).
+fn same_runtime(a: &str, b: &str) -> bool {
+    let (ra, rb) = (runtime_of(a), runtime_of(b));
+    ra.is_empty() || rb.is_empty() || ra == rb
 }
 
 fn rel(state: &ScoredState, path: &str) -> String {
@@ -1249,6 +1369,100 @@ const SHAPING_DECORATORS: &[&str] = &[
 
 /// The decorator that hands a definition to a registry, a router or a
 /// container, on the definition or on the class around it.
+/// JVM annotations that hand a method or a bean to a framework that calls
+/// it: request mappings, schedulers, listeners, bean factories. A
+/// class-level `@Component` registers the class, not every method on it.
+const JVM_ENTRY_POINTS: &[&str] = &[
+    "RequestMapping",
+    "GetMapping",
+    "PostMapping",
+    "PutMapping",
+    "DeleteMapping",
+    "PatchMapping",
+    "Scheduled",
+    "EventListener",
+    "TransactionalEventListener",
+    "KafkaListener",
+    "RabbitListener",
+    "JmsListener",
+    "SqsListener",
+    "ExceptionHandler",
+    "MessageMapping",
+    "SubscribeMapping",
+    "QueryMapping",
+    "MutationMapping",
+    "SubscriptionMapping",
+    "SchemaMapping",
+    "BatchMapping",
+    "Bean",
+    "PostConstruct",
+    "PreDestroy",
+    "Tool",
+    "GET",
+    "POST",
+    "PUT",
+    "DELETE",
+    "PATCH",
+    "HEAD",
+    "OPTIONS",
+    "Get",
+    "Post",
+    "Put",
+    "Delete",
+    "Patch",
+];
+
+/// Packages whose annotations are trusted as entry points when imported.
+const JVM_FRAMEWORK_PACKAGES: &[&str] = &[
+    "org.springframework.",
+    "jakarta.",
+    "javax.",
+    "io.micronaut.",
+    "io.quarkus.",
+    "org.eclipse.microprofile.",
+];
+
+fn is_jvm_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    [".kt", ".kts", ".java", ".scala"]
+        .iter()
+        .any(|e| p.ends_with(e))
+}
+
+/// The framework entry point annotating the JVM definition itself, its
+/// import naming a framework package. Unknown annotations are neutral.
+fn jvm_entry_point(f: &Fragment, file: &[&Fragment], kotlin: Option<&KDef>) -> Option<String> {
+    let names: Vec<String> = match kotlin {
+        Some(def) => def.decl.annotations.clone(),
+        None => f
+            .content
+            .lines()
+            .map(str::trim_start)
+            .take_while(|l| l.is_empty() || l.starts_with('@'))
+            .filter_map(|l| {
+                let name = l
+                    .strip_prefix('@')?
+                    .split(|c: char| c == '(' || c.is_whitespace())
+                    .next()?;
+                Some(name.rsplit('.').next().unwrap_or(name).to_string())
+            })
+            .collect(),
+    };
+    names.into_iter().find(|name| {
+        JVM_ENTRY_POINTS.contains(&name.as_str())
+            && file.iter().flat_map(|fr| fr.content.lines()).any(|line| {
+                let line = line.trim_start();
+                let Some(path) = line.strip_prefix("import ") else {
+                    return false;
+                };
+                let path = path.trim_end_matches(';').trim();
+                let path = path.split(" as ").next().unwrap_or(path);
+                JVM_FRAMEWORK_PACKAGES.iter().any(|p| path.starts_with(p))
+                    && (path.ends_with(&format!(".{name}")) || path.ends_with(".*"))
+            })
+    })
+}
+
 fn registering_decorator(f: &Fragment, file: &[&Fragment]) -> Option<String> {
     let of = |content: &str| {
         content
@@ -1414,8 +1628,19 @@ pub fn build_impact(
     deadline: Option<Instant>,
 ) -> ImpactOutput {
     let graph = &state.scoring_result.graph;
-    let by_id: FxHashMap<&FragmentId, &Fragment> =
-        state.all_fragments.iter().map(|f| (&f.id, f)).collect();
+    // A signature variant as long as its fragment shares its id (a Kotlin
+    // class header ending `) {`); the id names the fragment, not its stub.
+    let mut by_id: FxHashMap<&FragmentId, &Fragment> = FxHashMap::default();
+    for f in &state.all_fragments {
+        by_id
+            .entry(&f.id)
+            .and_modify(|seen| {
+                if seen.kind.is_signature() && !f.kind.is_signature() {
+                    *seen = f;
+                }
+            })
+            .or_insert(f);
+    }
     let changed_paths: FxHashSet<&str> = state
         .changed_files
         .iter()
@@ -1564,10 +1789,23 @@ pub fn build_impact(
                 .any(|d| words.contains(d.as_str()))
     };
     let resolver = Resolver::new(&state.root_dir, &source, universe);
+    let kotlin = KotlinResolver::new(&state.root_dir, &source);
+    let kotlin_def = |f: &Fragment| -> Option<KDef> {
+        let name = f.symbol_name.as_deref().map(base_symbol)?;
+        kotlin.definition(&rel(state, f.path()), name, f.start_line())
+    };
     let file_of = |f: &Fragment| files.fragments.get(f.path()).map_or(&[][..], Vec::as_slice);
     let class_of =
         |f: &Fragment| enclosing_class(f, file_of(f)).and_then(|c| c.symbol_name.clone());
     let finding = |user: &Fragment, used: &Fragment, name: &str| -> Option<Finding> {
+        if is_kotlin(user.path()) && is_kotlin(used.path()) {
+            let def = kotlin_def(used)?;
+            return kotlin.classify(
+                &rel(state, user.path()),
+                (user.start_line(), user.end_line()),
+                &def,
+            );
+        }
         // A function defined inside another one is a local name: only that
         // function can call it, never through a receiver. An enum, a record
         // or a module around a method is no such scope (`Op.PLUS.apply`).
@@ -1612,14 +1850,26 @@ pub fn build_impact(
             &def,
         )
     };
+    let registration = |f: &Fragment| -> Option<String> {
+        if is_jvm_path(f.path()) {
+            let def = is_kotlin(f.path()).then(|| kotlin_def(f)).flatten();
+            jvm_entry_point(f, file_of(f), def.as_ref())
+        } else {
+            registering_decorator(f, file_of(f))
+        }
+    };
     let modelled = |a: &Fragment, b: &Fragment| {
-        bindings::lang_of(a.path()).is_some()
-            && bindings::lang_of(a.path()) == bindings::lang_of(b.path())
+        (bindings::lang_of(a.path()).is_some()
+            && bindings::lang_of(a.path()) == bindings::lang_of(b.path()))
+            || (is_kotlin(a.path()) && is_kotlin(b.path()))
     };
     let link = |user: &Fragment, used: &Fragment| -> bool {
         let Some(name) = used.symbol_name.as_deref().map(base_symbol) else {
             return false;
         };
+        if !same_runtime(user.path(), used.path()) {
+            return false;
+        }
         if modelled(user, used) {
             finding(user, used, name).is_some_and(|f| f.evidence == Evidence::Resolved)
         } else {
@@ -1629,6 +1879,9 @@ pub fn build_impact(
         }
     };
     let reaches_file = |test: &Fragment, caller: &Fragment| -> bool {
+        if !same_runtime(test.path(), caller.path()) {
+            return false;
+        }
         if modelled(test, caller) {
             resolver.imports_file(&rel(state, test.path()), &rel(state, caller.path()))
         } else {
@@ -1715,7 +1968,8 @@ pub fn build_impact(
         let core_lang = crate::languages::get_language_for_file(core.path()).unwrap_or("");
         // With a binding model, imports decide which definition a reference
         // reaches; a name defined in many files is ambiguous only without one.
-        let binding_model = symbol.is_some() && bindings::lang_of(core.path()).is_some();
+        let binding_model = symbol.is_some()
+            && (bindings::lang_of(core.path()).is_some() || is_kotlin(core.path()));
         // A qualified query (`path:name`) names its definition; only a bare
         // name or a diff leaves the lexical model guessing among many.
         let qualified = query.is_some_and(|q| q.contains(':'));
@@ -1736,6 +1990,22 @@ pub fn build_impact(
         // question first.
         let mut dropped: FxHashMap<&'static str, usize> = FxHashMap::default();
         graph.for_each_reverse_neighbor(&core.id, |src, weight| {
+            // A signature variant stands for its fragment: the caller is the
+            // whole definition, and its call sites sit in the body.
+            let src = by_id
+                .get(src)
+                .filter(|f| f.kind.is_signature())
+                .and_then(|sig| {
+                    file_of(sig)
+                        .iter()
+                        .filter(|f| {
+                            !f.kind.is_signature()
+                                && f.start_line() == sig.start_line()
+                                && f.end_line() >= sig.end_line()
+                        })
+                        .min_by_key(|f| f.line_count())
+                })
+                .map_or(src, |f| &f.id);
             let reason = if ambiguous {
                 "ambiguous_name"
             } else if (state.core_ids.contains(src) && !bordering.contains(src))
@@ -1794,6 +2064,8 @@ pub fn build_impact(
                     && symbol.is_some_and(|s| defined_in.contains(&(s.to_string(), frag.path())));
                 if frag.kind == FragmentKind::Excerpt {
                     "excerpt"
+                } else if !same_runtime(frag.path(), core.path()) {
+                    "other_runtime"
                 } else if shadowed && !binding_model {
                     "defines_same_name"
                 } else if is_import_block(&frag.content) {
@@ -1838,6 +2110,88 @@ pub fn build_impact(
             };
             *dropped.entry(reason).or_default() += 1;
         });
+        // Kotlin reads its uses off the syntax, so a caller the graph never
+        // linked — a call through an inherited receiver, through the implicit
+        // `this` of the class — is still found, and implementations of an
+        // abstract member are their own relation.
+        if let Some(def) = is_kotlin(core.path()).then(|| kotlin_def(core)).flatten() {
+            let listed: FxHashSet<FragmentId> =
+                sources.iter().map(|(f, _, _)| f.id.clone()).collect();
+            let mut seen = listed;
+            let mut found: Vec<(&Fragment, Finding)> = Vec::new();
+            for (path, frags) in &files.fragments {
+                if !is_kotlin(path) {
+                    continue;
+                }
+                let rel_path = rel(state, path);
+                for line in kotlin.use_lines(&rel_path, &def) {
+                    let Some(frag) = frags
+                        .iter()
+                        .filter(|f| {
+                            f.start_line() <= line
+                                && f.end_line() >= line
+                                && f.kind != FragmentKind::Excerpt
+                                && !f.kind.is_signature()
+                        })
+                        .min_by_key(|f| f.line_count())
+                    else {
+                        continue;
+                    };
+                    if within(&frag.id, core)
+                        || (state.core_ids.contains(&frag.id) && !bordering.contains(&frag.id))
+                        || (query.is_none() && in_a_hunk(&frag.id))
+                        || !seen.insert(frag.id.clone())
+                    {
+                        continue;
+                    }
+                    if let Some(f) = finding(frag, core, symbol.map(base_symbol).unwrap_or("")) {
+                        found.push((frag, f));
+                    }
+                }
+            }
+            if def.decl.abstract_member {
+                let kotlin_paths: Vec<String> = files
+                    .fragments
+                    .keys()
+                    .filter(|p| is_kotlin(p))
+                    .map(|p| rel(state, p))
+                    .collect();
+                for (path, decl) in
+                    kotlin.implementers(&def, kotlin_paths.iter().map(String::as_str))
+                {
+                    let abs = state.root_dir.join(&path);
+                    let Some(frag) = files
+                        .fragments
+                        .iter()
+                        .find(|(p, _)| Path::new(p) == abs.as_path())
+                        .and_then(|(_, frags)| {
+                            frags.iter().copied().find(|f| {
+                                f.symbol_name.as_deref() == Some(decl.name.as_str())
+                                    && f.start_line() <= decl.start_line
+                                    && f.end_line() >= decl.start_line
+                            })
+                        })
+                    else {
+                        continue;
+                    };
+                    if (query.is_none() && in_a_hunk(&frag.id)) || !seen.insert(frag.id.clone()) {
+                        continue;
+                    }
+                    found.push((
+                        frag,
+                        Finding {
+                            evidence: Evidence::Resolved,
+                            relation: Relation::Implementation,
+                            lines: vec![decl.start_line],
+                        },
+                    ));
+                }
+            }
+            for (frag, f) in found {
+                let weight = graph.forward_edge_weight(&frag.id, &core.id).unwrap_or(0.0);
+                sources.push((frag, weight, Some(f)));
+            }
+        }
         if !dropped.is_empty() {
             tracing::debug!(
                 "impact {}::{}: kept {}, dropped {:?}",
@@ -1866,10 +2220,7 @@ pub fn build_impact(
             .map(|frag| {
                 let tested = tests.tested_by(frag, state, &by_id, &link);
                 let found = findings.get(&frag.id);
-                let registered_by = tested
-                    .is_none()
-                    .then(|| registering_decorator(frag, file_of(frag)))
-                    .flatten();
+                let registered_by = tested.is_none().then(|| registration(frag)).flatten();
                 Caller {
                     path: rel(state, frag.path()),
                     symbol: frag.symbol_name.clone(),
@@ -1892,6 +2243,7 @@ pub fn build_impact(
                     }),
                     relation: match found.map(|f| f.relation) {
                         Some(Relation::Reference) => "reference",
+                        Some(Relation::Implementation) => "implementation",
                         _ => "call",
                     },
                     sites: found.map(|f| f.lines.clone()).unwrap_or_default(),
@@ -1910,11 +2262,25 @@ pub fn build_impact(
             (Some((base, head)), true) => commits_touching(state, base, head, core),
             _ => 0,
         };
-        if query.is_none()
-            && is_public(core.path(), symbol, without_decorators(&core.content))
-            && rust_module_is_public(state, core.path())
-            && signature_changed(state, &base, core)
-        {
+        let public_change = if is_kotlin(core.path()) {
+            kotlin_def(core).is_some_and(|def| {
+                def.decl.effective == Some(KVisibility::Public)
+                    && kotlin
+                        .facts_at(&base, &def.path)
+                        .and_then(|old| {
+                            old.declarations
+                                .iter()
+                                .find(|d| d.key() == def.decl.key())
+                                .map(|d| d.signature != def.decl.signature)
+                        })
+                        .unwrap_or(true)
+            })
+        } else {
+            is_public(core.path(), symbol, without_decorators(&core.content))
+                && rust_module_is_public(state, core.path())
+                && signature_changed(state, &base, core)
+        };
+        if query.is_none() && public_change {
             public_api.push((
                 callers.is_empty(),
                 Contract {
@@ -1948,7 +2314,7 @@ pub fn build_impact(
         let untested = query.is_none()
             && tests.any()
             && !crate::testfiles::is_test_path(Path::new(core.path()))
-            && registering_decorator(core, file_of(core)).is_none()
+            && registration(core).is_none()
             && tests.tested_by(core, state, &by_id, &link).is_none();
         untested_definitions += usize::from(untested);
         let compatible_callers = if compatible {
@@ -1958,11 +2324,15 @@ pub fn build_impact(
         } else {
             0
         };
+        let missed_in = symbol
+            .map(|s| missed_namers(state, &files, s, core.path()))
+            .unwrap_or_default();
         if callers.is_empty()
             && compatible_callers == 0
             && commits < 2
             && query.is_none()
             && unresolved.is_none()
+            && missed_in.is_empty()
         {
             // Counted in the header, so named: a count of nothing listed
             // tells the reader neither where nor what (#398).
@@ -1985,6 +2355,7 @@ pub fn build_impact(
             unresolved,
             untested,
             compatible_callers,
+            missed_in,
         });
     }
     if query.is_none() && state.run.check() {
@@ -2006,8 +2377,11 @@ pub fn build_impact(
                     }
                 })
         };
+        let kotlin_removed = removed_kotlin(state, &kotlin, &base, head_rev.as_deref());
         for (sym, contract) in
             removed_definitions(state, &defined, head_rev.as_deref(), &in_a_hunk, &binds_to)
+                .into_iter()
+                .chain(kotlin_removed)
         {
             if let Some(c) = contract {
                 contracts.push(c);
@@ -2063,7 +2437,16 @@ pub fn build_impact(
     } else {
         (Vec::new(), 0)
     };
-    let empty = changed.is_empty() && contracts.is_empty() && limits.is_empty() && stale.is_empty();
+    let unanalysed = if query.is_none() {
+        unanalysed_files(state, &changed_files)
+    } else {
+        Vec::new()
+    };
+    let empty = changed.is_empty()
+        && contracts.is_empty()
+        && limits.is_empty()
+        && stale.is_empty()
+        && unanalysed.is_empty();
     let mut output = ImpactOutput {
         schema: IMPACT_SCHEMA,
         name: state
@@ -2090,6 +2473,8 @@ pub fn build_impact(
         untested_definitions,
         untested_unlisted,
         withheld_files: state.policy_excluded_count,
+        unanalysed_files: unanalysed,
+        unanalysed_files_omitted: 0,
         cap: IMPACT_TOKEN_CAP,
     };
     fit_to_cap(&mut output);
@@ -2152,12 +2537,23 @@ const GENERIC_DIRECTORIES: &[&str] = &[
     "cmd", "include", "source", "sources",
 ];
 
+// Every supported language's `keyword (…) {`: a control statement removed
+// from a body reads like a method header.
 const NOT_MEMBER_NAMES: &[&str] = &[
     "if",
     "for",
     "while",
     "switch",
     "catch",
+    "match",
+    "when",
+    "try",
+    "synchronized",
+    "using",
+    "lock",
+    "fixed",
+    "foreach",
+    "elseif",
     "return",
     "function",
     "super",
@@ -2184,6 +2580,142 @@ fn declared_name(line: &str) -> Option<(&str, bool)> {
 /// with the lines outside the diff that still name them (#367). They have
 /// no fragment at the head, so the callers graph never reaches them: an
 /// optional call (`engine.setGain?.()`) silently becomes a no-op.
+/// Kotlin declarations the range removed: in the base revision of a changed
+/// file and gone from it at the head, matched by owner, name, kind and
+/// receiver. What still uses one is found by the binding model, at the head.
+fn removed_kotlin(
+    state: &ScoredState,
+    kotlin: &KotlinResolver,
+    base: &str,
+    head: Option<&str>,
+) -> Vec<(ChangedSymbol, Option<Contract>)> {
+    let mut removed: Vec<KDef> = Vec::new();
+    // (path at the base, path at the head): a rename compares across both.
+    let renamed_to: FxHashMap<&str, &str> = state
+        .renamed_files
+        .iter()
+        .map(|(old, new)| (new.as_str(), old.as_str()))
+        .collect();
+    let pairs: Vec<(String, Option<String>)> = state
+        .changed_files
+        .iter()
+        .map(|p| rel(state, &p.to_string_lossy()))
+        .map(|p| {
+            let old = renamed_to
+                .get(p.as_str())
+                .map_or_else(|| p.clone(), |o| (*o).to_string());
+            (old, Some(p))
+        })
+        .chain(state.deleted_files.iter().map(|p| (p.clone(), None)))
+        .filter(|(old, _)| is_kotlin(old))
+        .collect();
+    for (old_path, new_path) in pairs {
+        let Some(old) = kotlin.facts_at(base, &old_path) else {
+            continue;
+        };
+        let new = new_path.as_deref().and_then(|p| kotlin.facts(p));
+        let path = new_path.unwrap_or_else(|| old_path.clone());
+        for d in &old.declarations {
+            let kept = new
+                .as_ref()
+                .is_some_and(|n| n.declarations.iter().any(|x| x.key() == d.key()));
+            if !kept && d.kind != "constructor" {
+                removed.push(KDef {
+                    path: path.clone(),
+                    decl: d.clone(),
+                    package: old.package.clone(),
+                });
+            }
+        }
+    }
+    if removed.is_empty() {
+        return Vec::new();
+    }
+    let names: Vec<String> = {
+        let mut n: Vec<String> = removed.iter().map(|d| d.decl.name.clone()).collect();
+        n.sort();
+        n.dedup();
+        n
+    };
+    let hits = crate::git::grep_lines(&state.root_dir, &names, head).unwrap_or_default();
+    let mut out = Vec::new();
+    for def in removed {
+        if !state.run.check() {
+            break;
+        }
+        let mut lines_by_file: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
+        for (path, line, text) in &hits {
+            if is_kotlin(path) && text.contains(def.decl.name.as_str()) {
+                lines_by_file.entry(path.as_str()).or_default().push(*line);
+            }
+        }
+        let mut callers: Vec<Caller> = Vec::new();
+        for (path, lines) in lines_by_file {
+            for line in lines {
+                let Some(found) = kotlin.classify(path, (line, line), &def) else {
+                    continue;
+                };
+                let holder = state
+                    .all_fragments
+                    .iter()
+                    .filter(|f| {
+                        rel(state, f.path()) == path
+                            && f.start_line() <= line
+                            && f.end_line() >= line
+                            && f.kind.is_definition_kind()
+                            && f.symbol_name.is_some()
+                    })
+                    .min_by_key(|f| f.line_count());
+                callers.push(Caller {
+                    path: path.to_string(),
+                    symbol: holder.and_then(|f| f.symbol_name.clone()),
+                    lines: holder.map_or_else(|| format!("{line}-{line}"), |f| lines_of(&f.id)),
+                    weight: 1.0,
+                    tested_by: None,
+                    tested_via: None,
+                    file_tested: false,
+                    registered_by: None,
+                    evidence: match found.evidence {
+                        Evidence::Resolved => "resolved",
+                        _ => "candidate",
+                    },
+                    reason: match found.evidence {
+                        Evidence::Candidate(r) => Some(r),
+                        _ => None,
+                    },
+                    relation: match found.relation {
+                        Relation::Reference => "reference",
+                        Relation::Implementation => "implementation",
+                        Relation::Call => "call",
+                    },
+                    sites: vec![line],
+                });
+            }
+        }
+        let contract = (def.decl.effective == Some(KVisibility::Public)).then(|| Contract {
+            path: def.path.clone(),
+            symbol: Some(def.decl.name.clone()),
+            kind: "removed_api",
+        });
+        out.push((
+            ChangedSymbol {
+                path: def.path.clone(),
+                symbol: Some(def.decl.name.clone()),
+                lines: format!("{}-{}", def.decl.start_line, def.decl.end_line),
+                kind: "removed".to_string(),
+                commits: 0,
+                callers: merge_by_symbol(callers),
+                unresolved: None,
+                untested: false,
+                compatible_callers: 0,
+                missed_in: Vec::new(),
+            },
+            contract,
+        ));
+    }
+    out
+}
+
 fn removed_definitions(
     state: &ScoredState,
     defined: &FxHashMap<&str, FxHashSet<String>>,
@@ -2193,7 +2725,9 @@ fn removed_definitions(
 ) -> Vec<(ChangedSymbol, Option<Contract>)> {
     let mut removed: Vec<(String, &crate::change_class::HunkText, bool)> = Vec::new();
     for h in &state.hunk_texts {
-        if !is_code_file(&h.path) {
+        // Kotlin's removals come from its facts (`removed_kotlin`): a call
+        // statement there ends with no `;` and read as a declaration.
+        if !is_code_file(&h.path) || is_kotlin(&h.path) {
             continue;
         }
         let (anchor, _) = h.new_range();
@@ -2401,6 +2935,7 @@ fn removed_definitions(
                 unresolved: None,
                 untested: false,
                 compatible_callers: 0,
+                missed_in: Vec::new(),
             },
             contract,
         ));
@@ -2628,7 +3163,8 @@ fn fit_with(output: &mut ImpactOutput, cap: u32, measure: &dyn Fn(&ImpactOutput)
         && output.stale_references_omitted == 0
         && output.truncated == 0
         && output.contracts_omitted == 0
-        && output.limits.is_empty();
+        && output.limits.is_empty()
+        && output.unanalysed_files.is_empty();
 }
 
 /// One step of shedding, least needed first; `false` once nothing more can
@@ -2638,6 +3174,11 @@ fn shed_one(output: &mut ImpactOutput) -> bool {
     if output.changed_files.len() > MAX_CHANGED_FILES_LISTED {
         output.changed_files_omitted += output.changed_files.len() - MAX_CHANGED_FILES_LISTED;
         output.changed_files.truncate(MAX_CHANGED_FILES_LISTED);
+        return true;
+    }
+    if output.unanalysed_files.len() > MAX_UNANALYSED_LISTED {
+        output.unanalysed_files_omitted += output.unanalysed_files.len() - MAX_UNANALYSED_LISTED;
+        output.unanalysed_files.truncate(MAX_UNANALYSED_LISTED);
         return true;
     }
     if output.contracts.pop().is_some() {
@@ -2818,6 +3359,78 @@ fn callers_phrase(output: &ImpactOutput, callers: usize, scope: &str) -> String 
     phrase
 }
 
+/// Which changed files were read as text and why: their callers, the
+/// definitions in them and the contracts they move are all missing from the
+/// counts above, and the reader has to know that to read a zero (#454).
+fn write_unanalysed(out: &mut String, output: &ImpactOutput) {
+    let partial = |f: &&UnanalysedFile| f.reason == "parse_partial";
+    let line = |files: Vec<&UnanalysedFile>, lead: &str, more: usize| {
+        if files.is_empty() {
+            return None;
+        }
+        let mut groups: Vec<(Option<&str>, &str, Vec<String>)> = Vec::new();
+        for f in files {
+            let shown = match f.lines.first() {
+                Some(l) if f.reason == "parse_partial" => format!("{}:{l}", f.path),
+                _ => f.path.clone(),
+            };
+            match groups
+                .iter_mut()
+                .find(|(l, r, _)| *l == f.language && *r == f.reason)
+            {
+                Some((_, _, paths)) => paths.push(shown),
+                None => groups.push((f.language, f.reason, vec![shown])),
+            }
+        }
+        let groups: Vec<String> = groups
+            .into_iter()
+            .map(|(language, reason, paths)| {
+                let why = crate::parsers::unanalysed_text(reason);
+                let examples = paths[..paths.len().min(UNANALYSED_EXAMPLES)].join(", ");
+                let rest = if paths.len() > UNANALYSED_EXAMPLES {
+                    ", …"
+                } else {
+                    ""
+                };
+                format!(
+                    "{} {} ({why}): {examples}{rest}",
+                    paths.len(),
+                    language.unwrap_or("code"),
+                )
+            })
+            .collect();
+        let more = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        Some(format!("({lead}: {}{more})", groups.join("; ")))
+    };
+    let whole: Vec<&UnanalysedFile> = output
+        .unanalysed_files
+        .iter()
+        .filter(|f| !partial(f))
+        .collect();
+    let parts: Vec<&UnanalysedFile> = output.unanalysed_files.iter().filter(partial).collect();
+    for text in [
+        line(
+            whole,
+            "not analysed, read as text — definitions, callers and tests in them are not counted",
+            output.unanalysed_files_omitted,
+        ),
+        line(
+            parts,
+            "analysed only in part — what sits on the lines the parse broke on is not counted",
+            0,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = writeln!(out, "{text}");
+    }
+}
+
 fn write_header(out: &mut String, output: &ImpactOutput) {
     let range = range_label(output.range.as_deref(), output.index_tree.as_deref());
     let all = || output.changed.iter().flat_map(|c| &c.callers);
@@ -2839,14 +3452,26 @@ fn write_header(out: &mut String, output: &ImpactOutput) {
         ));
     }
     let withheld = |what: &str| {
-        if output.withheld_files == 0 {
-            String::new()
-        } else {
-            format!(
+        let mut clause = String::new();
+        if output.withheld_files > 0 {
+            clause = format!(
                 ", {} {what} withheld by ignore rules",
                 output.withheld_files
-            )
+            );
         }
+        let partial = output
+            .unanalysed_files
+            .iter()
+            .filter(|f| f.reason == "parse_partial")
+            .count();
+        let unanalysed = output.unanalysed_files.len() + output.unanalysed_files_omitted - partial;
+        if unanalysed > 0 {
+            clause.push_str(&format!(", {unanalysed} not analysed"));
+        }
+        if partial > 0 {
+            clause.push_str(&format!(", {partial} analysed only in part"));
+        }
+        clause
     };
     match &output.symbol {
         Some(symbol) => {
@@ -2871,10 +3496,19 @@ fn write_header(out: &mut String, output: &ImpactOutput) {
                     format!(" ({} deleted)", output.deleted_files.len())
                 },
                 withheld("more"),
-                callers_phrase(output, callers, " outside the diff"),
+                callers_phrase(
+                    output,
+                    callers,
+                    if output.unanalysed_files.is_empty() {
+                        " outside the diff"
+                    } else {
+                        " outside the diff in the analysed files"
+                    }
+                ),
             );
         }
     }
+    write_unanalysed(out, output);
     if output.withheld_files > 0 {
         let _ = writeln!(
             out,
@@ -2944,6 +3578,33 @@ fn write_symbol(out: &mut String, sym: &ChangedSymbol, tests_known: bool, compac
     );
     if let Some(note) = &sym.unresolved {
         let _ = writeln!(out, "  - callers not resolved: {note}");
+    }
+    if !sym.missed_in.is_empty() {
+        let shown: Vec<String> = sym
+            .missed_in
+            .iter()
+            .take(UNANALYSED_EXAMPLES)
+            .map(|f| {
+                let at = f.lines.first().map(|l| format!(":{l}")).unwrap_or_default();
+                format!(
+                    "{}{at} ({})",
+                    f.path,
+                    crate::parsers::unanalysed_text(f.reason)
+                )
+            })
+            .collect();
+        let more = sym.missed_in.len().saturating_sub(UNANALYSED_EXAMPLES);
+        let _ = writeln!(
+            out,
+            "  - callers may be missing: named in {} file(s) not fully analysed: {}{}",
+            sym.missed_in.len(),
+            shown.join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        );
     }
     if sym.compatible_callers > 0 {
         let _ = writeln!(

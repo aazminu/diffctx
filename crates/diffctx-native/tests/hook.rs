@@ -311,7 +311,8 @@ fn comments_subshell_cds_cd_dash_and_heredoc_messages_keep_their_commit() {
         "def restock(item):\n    return item.count + 5\n",
     );
     let cache = TempDir::new().unwrap();
-    let command = format!("(cd {} && git commit -am x)", other.path().display());
+    // Quoted as a shell carries it: a Windows path's backslashes are not escapes.
+    let command = format!("(cd '{}' && git commit -am x)", other.path().display());
     let h = hook(repo, cache.path(), &payload(repo, &command));
     let context = context_of(&h);
     assert!(context.contains("shop/shelf.py::refill"), "{context}");
@@ -364,6 +365,31 @@ fn a_manual_impact_run_counts_as_the_review() {
     assert_eq!(
         again.stdout, "",
         "a second commit attempt of the same change"
+    );
+}
+
+/// #454: a commit of code this build reads as text is not silence — the
+/// hook saying nothing read as "nothing outside the diff is reached".
+#[test]
+fn a_commit_of_unparsed_code_says_it_was_not_analysed() {
+    let tmp = repo_with_pending_change();
+    let cache = TempDir::new().unwrap();
+    let repo = tmp.path();
+    git(repo, &["checkout", "-q", "--", "shop/pricing.py"]);
+    write(repo, "num/solver.f90", "module solver\nend module solver\n");
+    commit_all(repo, "solver");
+    write(
+        repo,
+        "num/solver.f90",
+        "module solver\ncontains\n  subroutine step(x)\n    real :: x\n  end subroutine step\nend module solver\n",
+    );
+    let h = hook(repo, cache.path(), &payload(repo, "git commit -am solver"));
+    assert_eq!(h.code, Some(0));
+    let context = context_of(&h);
+    assert!(context.contains("1 not analysed"), "{context}");
+    assert!(
+        context.contains("fortran (no grammar in this build): num/solver.f90"),
+        "{context}"
     );
 }
 
@@ -997,7 +1023,7 @@ fn the_git_dash_c_directory_wins_over_cwd() {
     let cache = TempDir::new().unwrap();
     let repo = tmp.path();
     let elsewhere = TempDir::new().unwrap();
-    let command = format!("git -C {} commit -am vat", repo.to_string_lossy());
+    let command = format!("git -C '{}' commit -am vat", repo.to_string_lossy());
     let h = hook(
         elsewhere.path(),
         cache.path(),
@@ -1602,6 +1628,9 @@ fn staging_the_line_does_by_other_means_previews_the_working_tree() {
     let repo = tmp.path();
     let diff = Command::new("git")
         .current_dir(repo)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .args(["diff"])
         .output()
         .unwrap();
@@ -1737,6 +1766,9 @@ fn a_fast_forward_to_the_upstream_is_silence() {
     let branch = String::from_utf8(
         Command::new("git")
             .current_dir(repo)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .output()
             .unwrap()
