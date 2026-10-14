@@ -136,9 +136,6 @@ silently:
   nightly re-runs with `DIFFCTX_YAML_IGNORE_BASELINE=1` to track
   baseline size. `DIFFCTX_YAML_CASES_LIMIT=20` sampling survives only
   in the local pre-commit hook.
-- E/Q discipline (CLAUDE.md): Q-class (output-changing) fixes are
-  frozen during an eval cycle — bugs like the `IntervalIndex::overlaps`
-  asymmetry stay documented + pinned, not fixed in-pass.
 - **Active-xfail semantics in the yaml harness**: a case with an active
   `xfail:` (reason/category set) reports test "ok" while its ORACLE still
   fails — the marker absorbs the failure; test "FAILED" on such a case
@@ -187,25 +184,16 @@ silently:
   (`diffctx-version` default), so a PR that changes selection is reviewed by
   the version before it — compare against a source install when the diff
   touches the engine.
-- Use the uv-tool binary `~/.local/bin/diffctx` (pipx-equivalent),
-  never `.venv/bin/diffctx`. Check its version FIRST (`uv tool list`,
-  not `--version` alone): a stale tool silently re-introduces fixed
-  bugs into reviews (a 1.12.2 tool leaked `.diffctx/ignore`-excluded
-  tests/yaml as context — the universe filter shipped in 1.12.3).
-  Refresh: `uv tool install 'diffctx[mcp]' --force --refresh`.
-- `--version` is useless for staleness here: the version string moves
-  only on release, so a tool built weeks ago still says `1.12.3`. Compare
-  the **extension's mtime** against HEAD's date
-  (`ls -la ~/.local/share/uv/tools/diffctx/lib/python*/site-packages/diffctx/_diffctx.abi3.so`).
-  To review a range that includes unreleased work, install from source:
-  `uv tool install . --force --reinstall`.
-- **A source install sticks.** The tool's receipt
-  (`~/.local/share/uv/tools/diffctx/uv-receipt.toml`) remembers the local
-  checkout, and a later `uv tool upgrade diffctx` rebuilds from it — the
-  "released" reviewer silently becomes a dev build (observed 2026-09-17:
-  `+ diffctx==1.16.0 (from file://…)`). Go back to the published wheel with
-  `uv tool install --force --reinstall --no-sources 'diffctx[mcp]==X.Y.Z'`
-  and confirm the receipt shows `no-sources = true`.
+- Review with the released package the plugin runs, pinned to the same
+  version: `uvx 'diffctx[mcp]==X.Y.Z' . --diff <range> --mode impact -f md`
+  (X.Y.Z = the version pinned in `plugin/hooks/diffctx-impact.sh`). The
+  plugin `diffctx@diffctx` is the one diffctx on this machine: no uv tool,
+  pipx or mise copy, which went stale silently and re-introduced fixed bugs
+  into reviews (a 1.12.2 tool leaked `.diffctx/ignore`-excluded context; a
+  source install's receipt made `uv tool upgrade` rebuild a dev build). A
+  pinned uvx resolves the published wheel every time. `.venv/bin/diffctx` is
+  the development build, never the reviewer; to review unreleased work, run
+  it deliberately and say so.
 - **Do not review with `--budget -1`.** Selection plus the post-passes are
   ~97% of wall clock on a wide range (#121); unlimited removes the stop and
   every cell hits the 300s deadline. A wide range at the default budget is
@@ -622,8 +610,9 @@ snapshots and the fixture worktree.
   hides `tests`, so no `FooTest.java`/`widget-spec.js` shape exists in
   it and a test-classifier change reads as bit-identical. Corpus +
   targeted unit tests carry that; bitcheck does not.
-- E-class claims ("no output change") land with a bitcheck result in the
-  same commit. Q-class still needs the corpus and a baseline edit.
+- A claimed pure refactor lands with a bitcheck result in the same commit;
+  an output-changing fix is judged by a known-answer test and by reading
+  each corpus case it flips (AGENTS.md), never parked for moving output.
 
 ## Measuring against a running build
 

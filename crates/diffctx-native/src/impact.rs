@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::bindings::{self, Definition, Evidence, Finding, Relation, Resolver, Site};
 use crate::container::{innermost, named_container_of, within};
 use crate::facts::kotlin::Visibility as KVisibility;
+use crate::go_bindings::{GoDef, GoResolver, is_go};
 use crate::graph::EdgeCategory;
 use crate::kotlin_bindings::{KDef, KotlinResolver, is_kotlin};
 use crate::pipeline::ScoredState;
@@ -118,6 +119,17 @@ pub struct ImpactOutput {
     /// Callers dropped to fit `IMPACT_TOKEN_CAP`, lowest weight first.
     #[serde(default, skip_serializing_if = "crate::render::is_zero")]
     pub truncated: usize,
+    /// Of `truncated`, the possible callers: the header counts every caller
+    /// found, shown or shed, and keeps the possible ones apart (#413).
+    #[serde(skip)]
+    pub truncated_possible: usize,
+    /// Symbols shed whole; the header's definition count still holds them.
+    #[serde(skip)]
+    pub symbols_omitted: usize,
+    /// Of `truncated`, the callers no test reaches: a header that counts
+    /// every caller found counts their test links the same way.
+    #[serde(skip)]
+    pub truncated_untested: usize,
     /// Changed files left out of `changed_files` to fit the cap; the count
     /// is still whole. The reader holds the file list already.
     #[serde(default, skip_serializing_if = "crate::render::is_zero")]
@@ -296,6 +308,21 @@ pub struct Contract {
     pub kind: &'static str,
 }
 
+/// Whether `code` binds `name` as a local — `let name`, `let mut name` — so
+/// that its calls of `name` reach the local, not a definition elsewhere.
+fn binds_locally(code: &str, name: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    code.match_indices(name).any(|(at, _)| {
+        let before = code[..at].trim_end();
+        let head = before.strip_suffix("mut").map_or(before, str::trim_end);
+        let Some(rest) = head.strip_suffix("let") else {
+            return false;
+        };
+        !rest.chars().next_back().is_some_and(word)
+            && !code[at + name.len()..].chars().next().is_some_and(word)
+    })
+}
+
 fn is_code_file(path: &str) -> bool {
     let ext = Path::new(path)
         .extension()
@@ -387,18 +414,16 @@ fn module_aliases(file_fragments: &[&Fragment], stem: &str) -> Vec<String> {
 }
 
 /// A method lives inside a type, or names its receiver in the declaration
-/// (`func (l *Ledger) Reconcile`, Kotlin `fun String.pad()`); anything else
-/// is reached through its module.
+/// (Kotlin `fun String.pad()`); anything else is reached through its module.
 /// `file`: the fragments of the core's own file, in fragment order.
 fn is_member(core: &Fragment, file: &[&Fragment]) -> bool {
     if enclosing_class(core, file).is_some() {
         return true;
     }
     let head = without_decorators(&core.content).trim_start();
-    let receiver = head.starts_with("func (")
-        || head
-            .strip_prefix("fun ")
-            .is_some_and(|rest| rest.split('(').next().is_some_and(|n| n.contains('.')));
+    let receiver = head
+        .strip_prefix("fun ")
+        .is_some_and(|rest| rest.split('(').next().is_some_and(|n| n.contains('.')));
     receiver
         || file.iter().any(|f| {
             f.path() == core.path()
@@ -414,8 +439,8 @@ fn is_member(core: &Fragment, file: &[&Fragment]) -> bool {
 /// siblings still name the module (`use`, `import`), so for them it must
 /// appear among the caller file's identifiers.
 const PACKAGE_SCOPED_EXTENSIONS: &[&str] = &[
-    "go", "java", "kt", "kts", "scala", "cs", "php", "c", "cc", "cpp", "cxx", "h", "hpp", "m",
-    "mm", "swift", "dart",
+    "java", "kt", "kts", "scala", "cs", "php", "c", "cc", "cpp", "cxx", "h", "hpp", "m", "mm",
+    "swift", "dart",
 ];
 
 /// What impact knows of each file in view: the identifiers of all its
@@ -429,7 +454,7 @@ struct Files<'a> {
 /// A caller that never names the changed file's module and lives in another
 /// directory is a name match, not a call: `Command` in a binary crate is not
 /// `std::process::Command`, however many files construct one. Same-directory
-/// callers in a package-scoped language (Go, Java, Kotlin) pass, because a
+/// callers in a package-scoped language (Java, C#, Swift) pass, because a
 /// package needs no import to reach its neighbours.
 fn references_module(
     caller: &Fragment,
@@ -462,10 +487,19 @@ fn references_module(
         // cannot be told apart from anything, so nothing is dropped on it.
         return true;
     }
-    if matches!(
-        stem.as_str(),
-        "mod" | "lib" | "main" | "index" | "init" | "__init__"
-    ) {
+    // A shell `lib.sh` is sourced by its own name, not its directory (#497).
+    let sourced_by_name = changed.extension().is_some_and(|e| {
+        matches!(
+            e.to_string_lossy().to_lowercase().as_str(),
+            "sh" | "bash" | "zsh" | "ksh"
+        )
+    });
+    if !sourced_by_name
+        && matches!(
+            stem.as_str(),
+            "mod" | "lib" | "main" | "index" | "init" | "__init__"
+        )
+    {
         // A module named for its role (`mod.rs`, `index.ts`, `__init__.py`)
         // is imported by its directory, and a binary root is not imported.
         let dir = changed
@@ -641,7 +675,12 @@ fn missed_namers(state: &ScoredState, files: &Files, name: &str, own: &str) -> V
     let mut out: Vec<UnanalysedFile> = state
         .run
         .bounded(&files.identifiers)
-        .filter(|(path, words)| **path != own && words.contains(word.as_str()))
+        // A file of another runtime cannot call the name, read or not: a
+        // shell script that broke the parse is no hedge on a JS function
+        // (#521).
+        .filter(|(path, words)| {
+            **path != own && words.contains(word.as_str()) && same_runtime(path, own)
+        })
         .filter_map(|(path, _)| {
             let rel_path = rel(state, path);
             let has_definition = files
@@ -660,6 +699,39 @@ fn missed_namers(state: &ScoredState, files: &Files, name: &str, own: &str) -> V
             })
         })
         .collect();
+    // A file over the size cap was never read into view, yet it may call the
+    // name like any other: it is said, not left out (#484). The run keeps
+    // the files the cap kept out.
+    let in_view: FxHashSet<String> = out.iter().map(|f| f.path.clone()).collect();
+    let too_large: Vec<String> = state
+        .run
+        .limited_files()
+        .into_iter()
+        .filter(|f| f.reason == crate::resource::LimitReason::FileTooLarge)
+        .map(|f| f.path)
+        .filter(|p| {
+            !in_view.contains(p) && rel(state, own) != *p && is_code_file(p) && same_runtime(p, own)
+        })
+        .collect();
+    for path in state.run.bounded(too_large) {
+        let Some(bytes) = source.read_bytes(&state.root_dir.join(&path)) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let named = text.match_indices(name).any(|(at, _)| {
+            let word = |c: char| c.is_alphanumeric() || c == '_';
+            !text[..at].chars().next_back().is_some_and(word)
+                && !text[at + name.len()..].chars().next().is_some_and(word)
+        });
+        if named {
+            out.push(UnanalysedFile {
+                language: crate::languages::get_language_for_file(&path),
+                path,
+                reason: "too_large",
+                lines: Vec::new(),
+            });
+        }
+    }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
@@ -687,6 +759,28 @@ fn runtime_of(path: &str) -> String {
 fn same_runtime(a: &str, b: &str) -> bool {
     let (ra, rb) = (runtime_of(a), runtime_of(b));
     ra.is_empty() || rb.is_empty() || ra == rb
+}
+
+/// A Rust `use` (or re-export) line.
+fn rust_use(text: &str) -> bool {
+    let t = text.trim_start();
+    let t = t
+        .strip_prefix("pub(crate) ")
+        .or_else(|| t.strip_prefix("pub "))
+        .unwrap_or(t);
+    t.starts_with("use ")
+}
+
+/// Where a private Rust item can be used: its own module file and the
+/// modules beneath it (`a/b.rs` reaches into `a/b/`; `mod.rs`, `lib.rs` and
+/// `main.rs` into their directory).
+fn rust_private_reach(caller: &str, removed: &str) -> bool {
+    let p = Path::new(removed);
+    let scope = match p.file_stem().and_then(|s| s.to_str()) {
+        Some("mod" | "lib" | "main") => p.parent().map(Path::to_path_buf),
+        _ => Some(p.with_extension("")),
+    };
+    caller == removed || scope.is_some_and(|d| Path::new(caller).starts_with(d))
 }
 
 fn rel(state: &ScoredState, path: &str) -> String {
@@ -854,9 +948,15 @@ fn is_schema_file(path: &str) -> bool {
             .is_some_and(|d| d == name)
     };
     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let migration = p
-        .components()
-        .any(|c| matches!(c.as_os_str().to_str(), Some("migrations" | "migration")))
+    // Prose and tables beside the migrations (a plan, an inventory) are no
+    // schema (#463).
+    let prose = matches!(
+        ext,
+        "md" | "markdown" | "rst" | "txt" | "adoc" | "tsv" | "csv"
+    );
+    let migration = !prose
+        && p.components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some("migrations" | "migration")))
         || lower.contains("/alembic/versions/")
         || lower.contains("db/migrate/")
         || (in_db("db") && matches!(stem, "schema" | "structure"));
@@ -1147,6 +1247,15 @@ fn merge_by_symbol(callers: Vec<Caller>) -> Vec<Caller> {
         };
         match merged.iter_mut().find(|m| same(m)) {
             Some(m) => {
+                // The caller spans every chunk it was split into, or a call
+                // site in a later chunk sits outside the range shown (#472).
+                let span = |l: &str| -> Option<(u32, u32)> {
+                    let (a, b) = l.split_once('-')?;
+                    Some((a.parse().ok()?, b.parse().ok()?))
+                };
+                if let (Some((a, b)), Some((c2, d))) = (span(&m.lines), span(&c.lines)) {
+                    m.lines = format!("{}-{}", a.min(c2), b.max(d));
+                }
                 m.symbol = m.symbol.as_deref().map(|s| base_symbol(s).to_string());
                 m.weight = m.weight.max(c.weight);
                 m.sites.extend(c.sites);
@@ -1239,6 +1348,38 @@ fn indent_of(text: &str) -> usize {
     text.lines()
         .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('@'))
         .map_or(0, |l| l.len() - l.trim_start().len())
+}
+
+/// The object literal a method belongs to — `cart` of
+/// `const cart = { total() {} }` — reached as `cart.total()` the way a
+/// class's method is reached through its instance (#473).
+fn object_owner(f: &Fragment, file: &[&Fragment]) -> Option<String> {
+    file.iter()
+        .filter(|o| {
+            o.kind == FragmentKind::Variable
+                && o.id != f.id
+                && o.start_line() <= f.start_line()
+                && o.end_line() >= f.end_line()
+                && o.content
+                    .split_once('=')
+                    .is_some_and(|(_, v)| v.trim_start().starts_with('{'))
+        })
+        .min_by_key(|o| o.line_count())
+        .and_then(|o| o.symbol_name.clone())
+}
+
+/// `name: (…) => …` or `name(…) {` as a property of an object no variable
+/// holds — a store built inside `create(...)`: a method of an owner the
+/// syntax does not name (#473).
+fn is_object_property(f: &Fragment, name: &str) -> bool {
+    let head = f.content.trim_start();
+    [
+        format!("{name}:"),
+        format!("\"{name}\":"),
+        format!("'{name}':"),
+    ]
+    .iter()
+    .any(|k| head.starts_with(k.as_str()))
 }
 
 fn enclosing_class<'a>(f: &Fragment, file: &[&'a Fragment]) -> Option<&'a Fragment> {
@@ -1407,6 +1548,42 @@ fn jvm_entry_point(f: &Fragment, file: &[&Fragment], kotlin: Option<&KDef>) -> O
                     && (path.ends_with(&format!(".{name}")) || path.ends_with(".*"))
             })
     })
+}
+
+/// A Python function decorated `@pytest.fixture` / `@fixture`, with or
+/// without arguments.
+fn is_pytest_fixture(f: &Fragment) -> bool {
+    f.path().ends_with(".py")
+        && f.content
+            .lines()
+            .map(str::trim_start)
+            .take_while(|l| l.is_empty() || l.starts_with('@'))
+            .any(|l| {
+                let d = l.trim_start_matches('@');
+                d.starts_with("pytest.fixture") || d.starts_with("fixture")
+            })
+}
+
+/// The line of `f`'s own `def` whose parameter list names `name`: how a
+/// test or a fixture asks pytest for a fixture.
+fn names_parameter(f: &Fragment, name: &str) -> Option<u32> {
+    let header = f.content.lines().position(|l| {
+        let t = l.trim_start();
+        t.starts_with("def ") || t.starts_with("async def ")
+    })?;
+    let signature: String = f
+        .content
+        .lines()
+        .skip(header)
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let params = signature.split_once('(')?.1.split_once(')')?.0;
+    params
+        .split(',')
+        .map(|p| p.trim().split([':', '=']).next().unwrap_or("").trim())
+        .any(|p| p == name)
+        .then(|| f.start_line() + header as u32)
 }
 
 fn registering_decorator(f: &Fragment, file: &[&Fragment]) -> Option<String> {
@@ -1753,6 +1930,13 @@ pub fn build_impact(
         let name = f.symbol_name.as_deref().map(base_symbol)?;
         kotlin.definition(&rel(state, f.path()), name, f.start_line())
     };
+    let go = GoResolver::new(&state.root_dir, &source);
+    // A method fragment may carry its receiver: `Ledger.Reconcile`.
+    let go_def = |f: &Fragment| -> Option<GoDef> {
+        let name = f.symbol_name.as_deref().map(base_symbol)?;
+        let name = name.rsplit('.').next().unwrap_or(name);
+        go.definition(&rel(state, f.path()), name, f.start_line())
+    };
     let file_of = |f: &Fragment| files.fragments.get(f.path()).map_or(&[][..], Vec::as_slice);
     let class_of =
         |f: &Fragment| enclosing_class(f, file_of(f)).and_then(|c| c.symbol_name.clone());
@@ -1760,6 +1944,14 @@ pub fn build_impact(
         if is_kotlin(user.path()) && is_kotlin(used.path()) {
             let def = kotlin_def(used)?;
             return kotlin.classify(
+                &rel(state, user.path()),
+                (user.start_line(), user.end_line()),
+                &def,
+            );
+        }
+        if is_go(user.path()) && is_go(used.path()) {
+            let def = go_def(used)?;
+            return go.classify(
                 &rel(state, user.path()),
                 (user.start_line(), user.end_line()),
                 &def,
@@ -1783,7 +1975,16 @@ pub fn build_impact(
             }
         }
         let path = rel(state, used.path());
-        let class = if scope.is_none() && is_member(used, file_of(used)) {
+        // An object literal holding the method is its owner before any
+        // class: a class kept as its header alone would otherwise claim every
+        // indented definition below it.
+        let class = if scope.is_some() {
+            None
+        } else if let Some(owner) = object_owner(used, file_of(used)) {
+            Some(owner)
+        } else if is_object_property(used, name) {
+            Some(bindings::UNKNOWN_OWNER.to_string())
+        } else if is_member(used, file_of(used)) {
             class_of(used)
         } else {
             None
@@ -1821,6 +2022,7 @@ pub fn build_impact(
         (bindings::lang_of(a.path()).is_some()
             && bindings::lang_of(a.path()) == bindings::lang_of(b.path()))
             || (is_kotlin(a.path()) && is_kotlin(b.path()))
+            || (is_go(a.path()) && is_go(b.path()))
     };
     let link = |user: &Fragment, used: &Fragment| -> bool {
         let Some(name) = used.symbol_name.as_deref().map(base_symbol) else {
@@ -1841,7 +2043,9 @@ pub fn build_impact(
         if !same_runtime(test.path(), caller.path()) {
             return false;
         }
-        if modelled(test, caller) {
+        if is_go(test.path()) && is_go(caller.path()) {
+            go.sees(&rel(state, test.path()), &rel(state, caller.path()))
+        } else if modelled(test, caller) {
             resolver.imports_file(&rel(state, test.path()), &rel(state, caller.path()))
         } else {
             one_project(test, caller) && references_module(test, &files, None, caller.path())
@@ -1894,6 +2098,27 @@ pub fn build_impact(
         .filter(|c| borders_only(c))
         .map(|c| &c.id)
         .collect();
+    // A constructor is called by its class's name (`cp.ComponentModel(b, 1)`,
+    // `new Store()`): its callers are the class's (#318). Mapped after the
+    // bordering test, which a class header with no hunk of its own would fail.
+    let cores: Vec<&Fragment> = {
+        let mut seen: FxHashSet<&FragmentId> = FxHashSet::default();
+        cores
+            .into_iter()
+            .map(|c| {
+                let constructor = c
+                    .symbol_name
+                    .as_deref()
+                    .map(base_symbol)
+                    .is_some_and(|s| matches!(s, "__init__" | "constructor"));
+                constructor
+                    .then(|| enclosing_class(c, file_of(c)))
+                    .flatten()
+                    .unwrap_or(c)
+            })
+            .filter(|c| seen.insert(&c.id))
+            .collect()
+    };
     // A queried name has no diff: a call from elsewhere in its own file is a
     // caller like any other.
     let inside_the_diff = |id: &FragmentId| {
@@ -1940,7 +2165,9 @@ pub fn build_impact(
         // With a binding model, imports decide which definition a reference
         // reaches; a name defined in many files is ambiguous only without one.
         let binding_model = symbol.is_some()
-            && (bindings::lang_of(core.path()).is_some() || is_kotlin(core.path()));
+            && (bindings::lang_of(core.path()).is_some()
+                || is_kotlin(core.path())
+                || is_go(core.path()));
         // A qualified query (`path:name`) names its definition; only a bare
         // name or a diff leaves the lexical model guessing among many.
         let qualified = query.is_some_and(|q| q.contains(':'));
@@ -1982,6 +2209,13 @@ pub fn build_impact(
                 Err("defines_same_name")
             } else if is_import_block(&frag.content) {
                 Err("import_block")
+            } else if !binding_model
+                && symbol.is_some_and(|s| {
+                    binds_locally(&code_text(frag.path(), &frag.content), base_symbol(s))
+                })
+            {
+                // `let read = |p| p + 1; read(1)` calls its own closure (#391).
+                Err("local_binding")
             } else if !is_code_file(frag.path()) {
                 Err("not_code")
             } else if binding_model && modelled(frag, core) {
@@ -2098,8 +2332,8 @@ pub fn build_impact(
         // caller that references many names can lose its edge to the changed
         // definition, and the answer read "0 callers" (#446, Forgejo #68). A
         // capped fragment naming the definition faces the same tests as an
-        // edge would have; Kotlin reads its uses off the syntax below.
-        if !ambiguous && !is_kotlin(core.path()) {
+        // edge would have; Kotlin and Go read their uses off the syntax below.
+        if !ambiguous && !is_kotlin(core.path()) && !is_go(core.path()) {
             let word = symbol.map(str::to_lowercase).unwrap_or_default();
             let capped = &graph.cap_stats.capped_sources;
             for frag in files
@@ -2127,21 +2361,65 @@ pub fn build_impact(
         if called_in_diff {
             dropped.insert("inside_the_diff", kept - sources.len());
         }
-        // Kotlin reads its uses off the syntax, so a caller the graph never
-        // linked — a call through an inherited receiver, through the implicit
-        // `this` of the class — is still found, and implementations of an
-        // abstract member are their own relation.
-        if let Some(def) = is_kotlin(core.path()).then(|| kotlin_def(core)).flatten() {
+        // A pytest fixture is called by the runner, for every test or fixture
+        // that names it as a parameter — in its own file or under the
+        // directory of the conftest that defines it (#401).
+        if let Some(name) = symbol.filter(|_| is_pytest_fixture(core)) {
+            let scope = Path::new(core.path()).parent().map(Path::to_path_buf);
+            let listed: FxHashSet<FragmentId> =
+                sources.iter().map(|(f, _, _)| f.id.clone()).collect();
+            let users: Vec<(&Fragment, u32)> = files
+                .fragments
+                .iter()
+                .filter(|(path, _)| {
+                    **path == core.path()
+                        || (Path::new(core.path()).file_name() == Some("conftest.py".as_ref())
+                            && scope
+                                .as_ref()
+                                .is_some_and(|d| Path::new(path).starts_with(d)))
+                })
+                .flat_map(|(_, frags)| frags.iter().copied())
+                .filter(|f| f.id != core.id && !listed.contains(&f.id))
+                .filter_map(|f| names_parameter(f, base_symbol(name)).map(|line| (f, line)))
+                .collect();
+            for (frag, line) in users {
+                if inside_the_diff(&frag.id) {
+                    called_in_diff = true;
+                    continue;
+                }
+                let weight = graph.forward_edge_weight(&frag.id, &core.id).unwrap_or(0.0);
+                sources.push((
+                    frag,
+                    weight,
+                    Some(Finding {
+                        evidence: Evidence::Resolved,
+                        relation: Relation::Reference,
+                        lines: vec![line],
+                    }),
+                ));
+            }
+        }
+        // Kotlin and Go read their uses off the syntax, so a caller the graph
+        // never linked — a call through an inherited receiver, through the
+        // implicit `this` of the class, a function the edge cap dropped — is
+        // still found, and implementations of an abstract member are their
+        // own relation.
+        let kotlin_core = is_kotlin(core.path()).then(|| kotlin_def(core)).flatten();
+        let go_core = is_go(core.path()).then(|| go_def(core)).flatten();
+        let use_lines = |path: &str| -> Vec<u32> {
+            match (&kotlin_core, &go_core) {
+                (Some(def), _) if is_kotlin(path) => kotlin.use_lines(&rel(state, path), def),
+                (_, Some(def)) if is_go(path) => go.use_lines(&rel(state, path), def),
+                _ => Vec::new(),
+            }
+        };
+        if kotlin_core.is_some() || go_core.is_some() {
             let listed: FxHashSet<FragmentId> =
                 sources.iter().map(|(f, _, _)| f.id.clone()).collect();
             let mut seen = listed;
             let mut found: Vec<(&Fragment, Finding)> = Vec::new();
             for (path, frags) in &files.fragments {
-                if !is_kotlin(path) {
-                    continue;
-                }
-                let rel_path = rel(state, path);
-                for line in kotlin.use_lines(&rel_path, &def) {
+                for line in use_lines(path) {
                     let Some(frag) = frags
                         .iter()
                         .filter(|f| {
@@ -2170,7 +2448,7 @@ pub fn build_impact(
                     }
                 }
             }
-            if def.decl.abstract_member {
+            if let Some(def) = kotlin_core.as_ref().filter(|d| d.decl.abstract_member) {
                 let kotlin_paths: Vec<String> = files
                     .fragments
                     .keys()
@@ -2213,6 +2491,35 @@ pub fn build_impact(
                 sources.push((frag, weight, Some(f)));
             }
         }
+        // A local `const items = rows(xs)` is a line of its function, not a
+        // caller of its own: the function is, with its test link (#452).
+        // An anonymous arrow (`.map((p) => …)`) is a line of the definition
+        // around it as well (#520).
+        for source in &mut sources {
+            let anonymous =
+                source.0.kind == FragmentKind::Function && source.0.symbol_name.is_none();
+            if source.0.kind != FragmentKind::Variable && !anonymous {
+                continue;
+            }
+            let enclosing = file_of(source.0)
+                .iter()
+                .filter(|f| {
+                    (f.kind == FragmentKind::Function
+                        || (anonymous && f.kind == FragmentKind::Variable))
+                        && f.symbol_name.is_some()
+                        && f.id != source.0.id
+                        && f.start_line() <= source.0.start_line()
+                        && f.end_line() >= source.0.end_line()
+                })
+                .min_by_key(|f| f.line_count());
+            if let Some(f) = enclosing {
+                source.0 = f;
+            }
+        }
+        sources.retain(|(f, _, _)| !within(&f.id, core));
+        let kept = sources.len();
+        sources.retain(|(f, _, _)| !inside_the_diff(&f.id));
+        called_in_diff = called_in_diff || sources.len() < kept;
         if !dropped.is_empty() {
             tracing::debug!(
                 "impact {}::{}: kept {}, dropped {:?}",
@@ -2228,14 +2535,18 @@ pub fn build_impact(
             .iter()
             .filter_map(|(f, _, finding)| finding.clone().map(|x| (&f.id, x)))
             .collect();
-        // An import line links too, at the import weight; the function that
-        // makes the call is the caller, the import is how it got the name.
+        // A name match links an import line too, at the import weight; the
+        // function that makes the call is the caller, the import is how it got
+        // the name. A binding finding skips import lines, so the module-level
+        // code it names calls the definition beside that function (#449).
         let named_files: FxHashSet<&str> = sources
             .iter()
             .filter(|(f, _, _)| f.symbol_name.is_some())
             .map(|(f, _, _)| f.path())
             .collect();
-        sources.retain(|(f, _, _)| f.symbol_name.is_some() || !named_files.contains(f.path()));
+        sources.retain(|(f, _, found)| {
+            f.symbol_name.is_some() || found.is_some() || !named_files.contains(f.path())
+        });
         let callers: Vec<Caller> = innermost(sources.iter().map(|(f, _, _)| *f).collect())
             .into_iter()
             .map(|frag| {
@@ -2415,6 +2726,31 @@ pub fn build_impact(
         .into_iter()
         .chain(kotlin_removed)
         {
+            let mut sym = sym;
+            // A caller of a removed definition is tested the way any caller
+            // is: a test that reaches it, or the test file it sits in (#413).
+            for c in &mut sym.callers {
+                let Some(site) = c.sites.first().copied() else {
+                    continue;
+                };
+                let Some(frag) = state
+                    .all_fragments
+                    .iter()
+                    .filter(|f| {
+                        f.symbol_name == c.symbol
+                            && f.start_line() <= site
+                            && f.end_line() >= site
+                            && rel(state, f.path()) == c.path
+                    })
+                    .min_by_key(|f| f.line_count())
+                else {
+                    continue;
+                };
+                let tested = tests.tested_by(frag, state, &by_id, &link);
+                c.file_tested = tested.is_none() && tests.file_tested(frag, &reaches_file);
+                c.tested_by = tested.as_ref().map(|(p, _)| rel(state, p));
+                c.tested_via = tested.and_then(|(_, via)| via);
+            }
             if let Some(c) = contract {
                 contracts.push(c);
             }
@@ -2519,6 +2855,9 @@ pub fn build_impact(
         contracts,
         empty,
         truncated: 0,
+        truncated_possible: 0,
+        symbols_omitted: 0,
+        truncated_untested: 0,
         changed_files_omitted: 0,
         untracked_files_omitted: 0,
         contracts_omitted,
@@ -2743,6 +3082,15 @@ fn removed_definitions(
                     .unwrap_or_default(),
             ),
         ) else {
+            // Declarations the grammar could not read in time (a parse past
+            // its budget on a large file) are definitions nobody can name as
+            // removed: the answer says so, never "nothing removed".
+            if crate::parsers::has_grammar(old_path) {
+                state.run.note_file(
+                    crate::resource::LimitReason::ReadFailed,
+                    old_path.to_string(),
+                );
+            }
             continue;
         };
         let still: FxHashSet<&str> = at_head.iter().map(|d| d.name.as_str()).collect();
@@ -2841,8 +3189,28 @@ fn removed_definitions(
                 .unwrap_or_default();
             text.contains(&format!("{stem}::{name}")) || text.contains(&format!("{stem}.{name}"))
         };
+        // Rust: a `use` bringing the name in from another module binds every
+        // use of it in that file there, and the `use` line is an import, not a
+        // reference. Removing a private duplicate in favour of an imported
+        // shared one listed both files' calls as broken.
+        let removed_module = Path::new(&path_removed)
+            .file_stem()
+            .map(|s| format!("{}::", s.to_string_lossy()))
+            .unwrap_or_default();
+        let imported_elsewhere: FxHashSet<String> = hits
+            .iter()
+            .filter(|(p, _, t)| p.ends_with(".rs") && rust_use(t) && !t.contains(&removed_module))
+            .map(|(p, _, _)| p.clone())
+            .collect();
         for (path, line, text) in hits {
             if !is_code_file(&path) {
+                continue;
+            }
+            if path.ends_with(".rs")
+                && (rust_use(&text)
+                    || imported_elsewhere.contains(&path)
+                    || (!exported && !rust_private_reach(&path, &path_removed)))
+            {
                 continue;
             }
             // A caller is code that can still reach the removed definition:
@@ -2861,7 +3229,12 @@ fn removed_definitions(
                 if path != path_removed && !bound {
                     continue;
                 }
-            } else if runtime_of(&path) != runtime_of(&path_removed) {
+            } else if runtime_of(&path) != runtime_of(&path_removed)
+                // A file that declares the name itself calls its own.
+                || holders.get(&path).is_some_and(|fs| {
+                    fs.iter().any(|f| f.symbol_name.as_deref() == Some(name.as_str()))
+                })
+            {
                 continue;
             }
             if let Some(at) = moved_to {
@@ -2928,7 +3301,10 @@ fn removed_definitions(
             });
         }
         let callers = merge_by_symbol(callers);
-        let contract = exported.then(|| Contract {
+        // A `pub fn` of a private module or of a binary is no API (#413).
+        let public =
+            rust_module_is_public(state, &state.root_dir.join(&path_removed).to_string_lossy());
+        let contract = (exported && public).then(|| Contract {
             path: path_removed.clone(),
             symbol: Some(name.clone()),
             kind: "removed_api",
@@ -3111,8 +3487,26 @@ fn stale_references(state: &ScoredState, diff_range: Option<&str>) -> (Vec<Stale
     let mut found = Vec::new();
     let mut per_target: FxHashMap<&str, usize> = FxHashMap::default();
     let mut omitted = 0;
+    // A line this change wrote about the deletion is its author's record of
+    // it — a changelog entry, a note, a comment — not a reference it missed;
+    // a code line it wrote still is one (#456).
+    let written: FxHashSet<(&str, &str)> = state
+        .hunk_texts
+        .iter()
+        .flat_map(|h| h.added.iter().map(move |l| (h.path.as_str(), l.trim())))
+        .collect();
+    // `--flag path` in a shell line and `*p` in C are code, not comments.
+    let commented = |text: &str| {
+        let t = text.trim_start();
+        ["#", "//", "/*", "* "].iter().any(|m| t.starts_with(m)) || t == "*"
+    };
     for (path, line, text) in state.run.bounded(&lines) {
         if renamed_to.contains(path.as_str()) {
+            continue;
+        }
+        if written.contains(&(path.as_str(), text.trim()))
+            && (!is_code_file(path) || commented(text))
+        {
             continue;
         }
         let surviving = &surviving;
@@ -3125,7 +3519,9 @@ fn stale_references(state: &ScoredState, diff_range: Option<&str>) -> (Vec<Stale
                     .filter(|(t, _)| t != path)
                     .filter_map(move |(t, kind)| {
                         let basename = t.rsplit('/').next().unwrap_or(t);
-                        naming(m.as_str(), path, t, !surviving.contains(basename))
+                        // A path that ends a sentence carries its full stop.
+                        let token = m.as_str().trim_end_matches('.');
+                        naming(token, path, t, !surviving.contains(basename))
                             .map(|n| (n, std::cmp::Reverse(t.len()), t, kind))
                     })
             })
@@ -3201,14 +3597,7 @@ fn shed_one(output: &mut ImpactOutput) -> bool {
         output.unanalysed_files.truncate(MAX_UNANALYSED_LISTED);
         return true;
     }
-    if output.contracts.pop().is_some() {
-        output.contracts_omitted += 1;
-        return true;
-    }
-    if output.stale_references.pop().is_some() {
-        output.stale_references_omitted += 1;
-        return true;
-    }
+    // A possible caller is a guess; a changed contract is a fact (#413).
     if let Some(sym) = output
         .changed
         .iter_mut()
@@ -3217,8 +3606,17 @@ fn shed_one(output: &mut ImpactOutput) -> bool {
         if let Some(i) = sym.callers.iter().rposition(|x| x.evidence == "candidate") {
             sym.callers.remove(i);
             output.truncated += 1;
+            output.truncated_possible += 1;
             return true;
         }
+    }
+    if output.contracts.pop().is_some() {
+        output.contracts_omitted += 1;
+        return true;
+    }
+    if output.stale_references.pop().is_some() {
+        output.stale_references_omitted += 1;
+        return true;
     }
     // A symbol whose callers could not be resolved says so to the last:
     // dropping it would turn "unknown" into "nothing".
@@ -3228,6 +3626,7 @@ fn shed_one(output: &mut ImpactOutput) -> bool {
         .rposition(|c| c.callers.is_empty() && c.unresolved.is_none() && c.compatible_callers == 0)
     {
         output.changed.remove(i);
+        output.symbols_omitted += 1;
         return true;
     }
     shed_weakest_caller(output)
@@ -3256,13 +3655,20 @@ fn shed_weakest_caller(output: &mut ImpactOutput) -> bool {
         // The strongest caller of a symbol is the fact; the symbol goes
         // whole once that is all it has left, never one caller at a time.
         Some(i) if output.changed[i].callers.len() > 1 => {
-            output.changed[i].callers.pop();
+            let shed = output.changed[i].callers.pop();
+            output.truncated_untested += usize::from(shed.as_ref().is_some_and(without_test_link));
             output.truncated += 1;
             true
         }
         Some(i) if output.changed[i].unresolved.is_none() => {
             output.truncated += output.changed[i].callers.len();
+            output.truncated_untested += output.changed[i]
+                .callers
+                .iter()
+                .filter(|c| without_test_link(c))
+                .count();
             output.changed.remove(i);
+            output.symbols_omitted += 1;
             true
         }
         _ => false,
@@ -3298,15 +3704,18 @@ pub fn render_automatic(output: &mut ImpactOutput, cap: u32) -> String {
 /// uncommitted work, not the last commit. The staged changes name the index
 /// tree they were captured as. The JSON keeps the range as given (#347).
 fn range_label(range: Option<&str>, index_tree: Option<&str>) -> String {
-    if let Some(tree) = index_tree {
-        return format!(
+    match (range, index_tree) {
+        // `A..T` names a tree its caller built — the hook's set of edited
+        // files — which is no more the index than any other tree (#463).
+        (Some(r), Some(tree)) if !crate::git::is_staged_keyword(r) => {
+            format!("the snapshot tree {}", &tree[..tree.len().min(10)])
+        }
+        (_, Some(tree)) => format!(
             "staged changes (index tree {})",
             &tree[..tree.len().min(10)]
-        );
-    }
-    match range {
-        None | Some("HEAD") => "uncommitted changes".to_string(),
-        Some(r) => r.to_string(),
+        ),
+        (None | Some("HEAD"), None) => "uncommitted changes".to_string(),
+        (Some(r), None) => r.to_string(),
     }
 }
 
@@ -3474,9 +3883,10 @@ fn write_unanalysed(out: &mut String, output: &ImpactOutput) {
 fn write_header(out: &mut String, output: &ImpactOutput) {
     let range = range_label(output.range.as_deref(), output.index_tree.as_deref());
     let all = || output.changed.iter().flat_map(|c| &c.callers);
-    let callers = all().filter(|c| c.evidence != "candidate").count();
-    let possible = all().filter(|c| c.evidence == "candidate").count();
-    let untested = all().filter(|c| without_test_link(c)).count();
+    let callers = all().filter(|c| c.evidence != "candidate").count() + output.truncated
+        - output.truncated_possible;
+    let possible = all().filter(|c| c.evidence == "candidate").count() + output.truncated_possible;
+    let untested = all().filter(|c| without_test_link(c)).count() + output.truncated_untested;
     let mut guard_summary = if output.tests_known {
         format!(", {untested} without a static test link")
     } else {
@@ -3518,7 +3928,7 @@ fn write_header(out: &mut String, output: &ImpactOutput) {
             let _ = writeln!(
                 out,
                 "diffctx impact for symbol {symbol}: {} definition(s){}, {}{guard_summary}",
-                output.changed.len(),
+                output.changed.len() + output.symbols_omitted,
                 withheld("file(s) naming it"),
                 callers_phrase(output, callers, ""),
             );

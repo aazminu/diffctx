@@ -154,7 +154,7 @@ static JS_EXPORT_FROM: Lazy<Regex> = Lazy::new(|| {
 });
 static JS_REQUIRE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"(?s)\b(?:const|let|var)\s+(\{[^}]*\}|[\w$]+)\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)"#,
+        r#"(?s)\b(?:const|let|var)\s+(\{[^}]*\}|[\w$]+)\s*=\s*(?:require|await\s+import)\(\s*['"]([^'"]+)['"]\s*\)"#,
     )
     .unwrap()
 });
@@ -188,6 +188,15 @@ fn is_ident(s: &str) -> bool {
         && !s.starts_with(|c: char| c.is_ascii_digit())
 }
 
+/// `import('./x').then(m => …)`, `.then((m) => …)`, `.then(function (m)`:
+/// the callback's parameter is the module (#479, `React.lazy`).
+static JS_DYNAMIC_THEN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"\bimport\(\s*['"]([^'"]+)['"]\s*\)\s*\.then\(\s*(?:async\s+)?(?:function\s*)?\(?\s*([A-Za-z_$][\w$]*)"#,
+    )
+    .unwrap()
+});
+
 pub fn js_bindings(text: &str) -> FileBindings {
     let mut b = FileBindings::default();
     for c in JS_IMPORT.captures_iter(text) {
@@ -204,6 +213,10 @@ pub fn js_bindings(text: &str) -> FileBindings {
             b.names
                 .insert(lhs.to_string(), Target::Module(c[2].to_string()));
         }
+    }
+    for c in JS_DYNAMIC_THEN.captures_iter(text) {
+        b.names
+            .insert(c[2].to_string(), Target::Module(c[1].to_string()));
     }
     b
 }
@@ -565,6 +578,8 @@ pub struct Resolver<'a> {
     /// Python resolution scans every file of the snapshot; the same
     /// importer asks about the same specifier once per caller it checks.
     resolved: RefCell<FxHashMap<(String, String), Resolution>>,
+    /// The repository's own npm packages, by name: (directory, entries).
+    workspace: std::cell::OnceCell<FxHashMap<String, (String, Vec<String>)>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -577,6 +592,7 @@ impl<'a> Resolver<'a> {
             ts_configs,
             cache: RefCell::default(),
             resolved: RefCell::default(),
+            workspace: std::cell::OnceCell::new(),
         }
     }
 
@@ -677,6 +693,63 @@ impl<'a> Resolver<'a> {
             .find(|p| self.files.contains(p))
     }
 
+    /// A specifier naming one of the repository's own packages — an npm
+    /// workspace member — resolves into its source, not to an external
+    /// dependency (#474).
+    fn workspace_package(&self, spec: &str) -> Option<String> {
+        let packages = self.workspace.get_or_init(|| {
+            let mut out = FxHashMap::default();
+            for file in self.files.iter().filter(|f| {
+                (f.as_str() == "package.json" || f.ends_with("/package.json"))
+                    && !f.contains("node_modules/")
+            }) {
+                let Some(doc) = self
+                    .source
+                    .read_to_string(&self.root.join(file))
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                else {
+                    continue;
+                };
+                let Some(name) = doc["name"].as_str() else {
+                    continue;
+                };
+                let exports = &doc["exports"];
+                let dot = exports.get(".").unwrap_or(exports);
+                let entries: Vec<String> = [
+                    doc["source"].as_str(),
+                    dot.as_str(),
+                    dot["import"].as_str(),
+                    dot["default"].as_str(),
+                    doc["module"].as_str(),
+                    doc["main"].as_str(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|e| e.trim_start_matches("./").to_string())
+                .collect();
+                out.insert(name.to_string(), (parent_dir(file).to_string(), entries));
+            }
+            out
+        });
+        let (name, (dir, entries)) = packages
+            .iter()
+            .filter(|(n, _)| spec == n.as_str() || spec.starts_with(&format!("{n}/")))
+            .max_by_key(|(n, _)| n.len())?;
+        let at = |rel: &str| normalize(&Path::new(dir).join(rel));
+        let sub = spec[name.len()..].trim_start_matches('/');
+        if sub.is_empty() {
+            entries
+                .iter()
+                .map(|e| at(e))
+                .chain(["src/index", "index"].map(at))
+                .find_map(|p| self.probe_js(&p))
+        } else {
+            [at(sub), at(&format!("src/{sub}"))]
+                .iter()
+                .find_map(|p| self.probe_js(p))
+        }
+    }
+
     fn resolve_js(&self, importer: &str, spec: &str) -> Resolution {
         if spec.starts_with("./") || spec.starts_with("../") || spec == "." || spec == ".." {
             let joined = normalize(&PathBuf::from(parent_dir(importer)).join(spec));
@@ -701,6 +774,9 @@ impl<'a> Resolver<'a> {
                 return Resolution::File(found);
             }
         }
+        if let Some(found) = self.workspace_package(spec) {
+            return Resolution::File(found);
+        }
         let alias_like = spec.starts_with("@/")
             || spec.starts_with("~/")
             || spec.starts_with('#')
@@ -712,6 +788,10 @@ impl<'a> Resolver<'a> {
         }
     }
 }
+
+/// The owner of a method the syntax does not name: an object built inside a
+/// call. A call through any receiver may reach it.
+pub(crate) const UNKNOWN_OWNER: &str = "<object>";
 
 /// How a reference relates to the changed definition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -812,6 +892,14 @@ fn params_of(content: &str) -> FxHashSet<String> {
             }
             _ => {}
         }
+    }
+    // `const x = (f(y) || []).map(…)` opens a parenthesised expression, not
+    // an arrow's parameters: those are followed by `=>` or a return type
+    // (#520).
+    let arrow_form = found.as_str().trim_end().ends_with('(') && found.as_str().contains('=');
+    let rest = head.get(end + 1..).unwrap_or("").trim_start();
+    if arrow_form && !(rest.starts_with("=>") || rest.starts_with(':')) {
+        return FxHashSet::default();
     }
     head[start..end]
         .split(',')
@@ -1030,7 +1118,7 @@ impl Resolver<'_> {
 
     /// What `receiver.method` says about the receiver being `class`.
     fn receiver_is(&self, site: &Site, chain: &str, def: &Definition, class: &str) -> Evidence {
-        if chain.is_empty() {
+        if chain.is_empty() || class == UNKNOWN_OWNER {
             return Evidence::Candidate("receiver_unresolved");
         }
         if matches!(chain, "self" | "cls" | "this") {
@@ -1069,10 +1157,23 @@ impl Resolver<'_> {
     /// Whether `ctor` (`Bot`, `bots.Bot`) constructs `class`. A name nothing
     /// binds — a factory passed in, a local helper — leaves it unknown.
     fn constructor_is(&self, site: &Site, ctor: &str, def: &Definition, class: &str) -> Evidence {
+        // `model: Any` states no type: the receiver is unknown, not another
+        // class (#425).
+        if matches!(ctor, "Any" | "typing.Any" | "t.Any" | "object") {
+            return Evidence::Candidate("receiver_unresolved");
+        }
         let ctor_head = ctor.rsplit('.').next().unwrap_or(ctor);
         if ctor.contains('.') {
             let module = &ctor[..ctor.len() - ctor_head.len() - 1];
             if ctor_head != class {
+                // `await Model.from_config(…)`: a factory on the class most
+                // often returns one, which the syntax cannot confirm (#425).
+                if module.rsplit('.').next() == Some(class) {
+                    return match self.constructor_is(site, module, def, class) {
+                        Evidence::Rejected => Evidence::Rejected,
+                        _ => Evidence::Candidate("receiver_unresolved"),
+                    };
+                }
                 return Evidence::Rejected;
             }
             let bound = self
@@ -1206,7 +1307,12 @@ pub(crate) fn is_import_line(code: &str) -> bool {
 
 /// Folds one occurrence into the finding: stronger evidence replaces the
 /// lines, equal evidence adds its line, a call outranks a reference.
-fn absorb(best: &mut Option<Finding>, evidence: Evidence, relation: Relation, line: u32) {
+pub(crate) fn absorb(
+    best: &mut Option<Finding>,
+    evidence: Evidence,
+    relation: Relation,
+    line: u32,
+) {
     let Some(f) = best else {
         *best = Some(Finding {
             evidence,

@@ -1522,11 +1522,9 @@ pub fn grep_code_words(
         .iter()
         .map(|ext| format!(":(glob,icase)**/*{ext}"))
         .collect();
+    let patterns = Patterns::new(words);
     let mut args: Vec<&str> = vec!["grep", "-n", "-z", "-I", "-F", "-w", "-m", &per_file];
-    for w in words {
-        args.push("-e");
-        args.push(w);
-    }
+    args.extend(patterns.args.iter().map(String::as_str));
     args.extend(rev);
     args.push("--");
     args.extend(globs.iter().map(String::as_str));
@@ -1543,13 +1541,51 @@ pub fn grep_lines(
     if needles.is_empty() {
         return Ok(Grepped::default());
     }
+    let patterns = Patterns::new(needles);
     let mut args: Vec<&str> = vec!["grep", "-n", "-z", "-I", "-F"];
-    for n in needles {
-        args.push("-e");
-        args.push(n);
-    }
+    args.extend(patterns.args.iter().map(String::as_str));
     args.extend(rev);
     grep_rows(repo_root, &args, rev)
+}
+
+/// `-f FILE` naming the patterns one per line, or `-e` per pattern when the
+/// file cannot be written: tens of thousands of `-e` arguments overflow
+/// ARG_MAX and the whole search fails (#440). The file goes with the value.
+struct Patterns {
+    file: Option<PathBuf>,
+    args: Vec<String>,
+}
+
+impl Patterns {
+    fn new(words: &[String]) -> Self {
+        // An empty line would match every line.
+        let listed: Vec<&str> = words
+            .iter()
+            .map(String::as_str)
+            .filter(|w| !w.is_empty())
+            .collect();
+        match write_private_temp_file(&listed.join("\n")) {
+            Some(file) => Self {
+                args: vec!["-f".to_string(), file.to_string_lossy().into_owned()],
+                file: Some(file),
+            },
+            None => Self {
+                file: None,
+                args: listed
+                    .iter()
+                    .flat_map(|w| ["-e".to_string(), (*w).to_string()])
+                    .collect(),
+            },
+        }
+    }
+}
+
+impl Drop for Patterns {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            let _ = std::fs::remove_file(file);
+        }
+    }
 }
 
 pub fn get_untracked_files(repo_root: &Path, pathspec: &[String]) -> Result<Vec<PathBuf>> {

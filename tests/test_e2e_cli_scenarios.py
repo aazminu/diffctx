@@ -401,6 +401,21 @@ class TestDiffModeJourneys:
         assert "wall-clock deadline" in result.stderr
         assert "--timeout" in result.stderr
 
+    @pytest.mark.parametrize("value", ["²", "+5", "99999999999999999999", "18446744073709551615"])
+    def test_an_odd_watchdog_override_is_no_override_and_no_crash(self, value):
+        """#410: the override is ASCII digits within u64, as the binary reads
+        it; "²" raised from int(), a huge value overflowed thread.join."""
+        script = (
+            "from diffctx._app import _call_with_wall_clock_deadline\n"
+            "print(_call_with_wall_clock_deadline(lambda: 'ok', 1, 'diffctx'))\n"
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(SRC_DIR)
+        env["DIFFCTX_TEST_WATCHDOG_GRACE_SECS"] = value
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env, timeout=30, check=False)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "ok"
+
     def test_a_pipeline_that_stops_at_its_deadline_still_answers(self):
         """#382: the engine returns a partial answer at --timeout; a watchdog
         firing at the same instant killed it and printed nothing at all."""

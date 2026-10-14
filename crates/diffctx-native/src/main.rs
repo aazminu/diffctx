@@ -113,8 +113,10 @@ struct Cli {
     /// navigation list with provenance reasons, JSON only (--format ignored);
     /// `impact` = callers outside the diff, their tests, cross-commit overlap
     /// (JSON, or text with `-f md`)
-    #[arg(long, default_value = "pack", value_parser = ["pack", "locate", "impact"])]
-    mode: String,
+    /// `pack` when not given; a `--symbol` answers in `impact` and refuses
+    /// any other mode named outright, as the Python CLI does (#410).
+    #[arg(long, value_parser = ["pack", "locate", "impact"])]
+    mode: Option<String>,
 
     /// Wall-clock deadline in seconds; on expiry diffctx exits 124
     #[arg(long, default_value_t = DEFAULT_PIPELINE_TIMEOUT_SECONDS, value_parser = clap::value_parser!(u64).range(1..))]
@@ -250,9 +252,12 @@ const WATCHDOG_GRACE_SECS: u64 = 30;
 /// Test hook: the whole watchdog wait, deadline included, so its exit 124 is
 /// reachable on a small repository (`0` fires before the worker can answer).
 /// Non-semantic: it decides only when to abort, never what is selected.
+/// ASCII digits within u64, as the Python CLI reads it: `+5`, `²` and an
+/// overflowing value are no override (#410).
 fn test_watchdog_secs() -> Option<u64> {
     std::env::var("DIFFCTX_TEST_WATCHDOG_GRACE_SECS")
         .ok()
+        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|v| v.parse().ok())
 }
 
@@ -560,8 +565,9 @@ fn real_main() -> Result<()> {
     let no_content = cli.no_content;
     let full = cli.full;
 
+    let mode = cli.mode.as_deref().unwrap_or("pack");
     if let Some(symbol) = cli.symbol.clone() {
-        if cli.mode == "locate" {
+        if cli.mode.as_deref().is_some_and(|m| m != "impact") {
             eprintln!("error: --symbol answers in --mode impact");
             std::process::exit(EXIT_USAGE);
         }
@@ -577,14 +583,14 @@ fn real_main() -> Result<()> {
         })?;
         return emit_impact(&cli, output);
     }
-    if cli.mode == "impact" {
+    if mode == "impact" {
         return run_impact(&cli, path, diff_ref, alpha, scoring_mode, timeout);
     }
     if matches!(cli.format, OutputFormat::Md) {
         eprintln!("error: --format md is only available with --mode impact");
         std::process::exit(EXIT_USAGE);
     }
-    if cli.mode == "locate" {
+    if mode == "locate" {
         if full {
             eprintln!(
                 "error: --mode locate is incompatible with --full (locate ranks the selection; --full bypasses it)"

@@ -3627,3 +3627,560 @@ fn a_removed_definition_is_called_only_from_code_that_can_reach_it() {
         "{doc}"
     );
 }
+
+/// A file that declares a removed definition's name itself calls its own:
+/// deleting a private `helper` in one Rust file listed another file's calls
+/// to its own `helper` as broken callers.
+#[test]
+fn a_file_with_its_own_definition_of_the_name_is_no_caller_of_the_removed_one() {
+    let tmp = repo_of(
+        &[
+            (
+                "src/a.rs",
+                "pub fn helper() -> u8 {\n    1\n}\n\npub fn keep() -> u8 {\n    helper()\n}\n",
+            ),
+            (
+                "src/b.rs",
+                "pub fn helper() -> u8 {\n    2\n}\n\npub fn other() -> u8 {\n    helper()\n}\n",
+            ),
+            (
+                "src/c.rs",
+                "pub fn third() -> u8 {\n    crate::a::helper()\n}\n",
+            ),
+        ],
+        &[("src/a.rs", "pub fn keep() -> u8 {\n    1\n}\n")],
+    );
+    let doc = impact(tmp.path(), "HEAD~1..HEAD");
+    let callers: Vec<String> = doc["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["kind"] == "removed" && c["symbol"] == "helper")
+        .flat_map(|c| c["callers"].as_array().cloned().unwrap_or_default())
+        .map(|k| k["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(callers, ["src/c.rs"], "{doc}");
+}
+
+fn impact_budget_md(repo: &Path, budget: &str) -> String {
+    let out = Command::new(&*BIN)
+        .current_dir(repo)
+        .args([
+            "--diff",
+            "HEAD~1..HEAD",
+            "--mode",
+            "impact",
+            "-q",
+            "-f",
+            "md",
+            "--budget",
+            budget,
+        ])
+        .output()
+        .expect("run diffctx");
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).expect("utf8")
+}
+
+/// #413 (2): a caller of a removed definition is tested like any caller —
+/// by a test that reaches it, or by being the test.
+#[test]
+fn callers_of_a_removed_definition_keep_their_test_links() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = tmp.path();
+    init_repo(repo);
+    write(
+        repo,
+        "lib.py",
+        "def gone():\n    return 1\n\n\ndef kept():\n    return 2\n",
+    );
+    write(
+        repo,
+        "app.py",
+        "from lib import gone\n\n\ndef use():\n    return gone()\n",
+    );
+    write(
+        repo,
+        "tests/test_app.py",
+        "from app import use\n\n\ndef test_use():\n    assert use() == 1\n",
+    );
+    write(
+        repo,
+        "tests/test_lib.py",
+        "from lib import gone\n\n\ndef test_gone():\n    assert gone() == 1\n",
+    );
+    commit_all(repo, "base");
+    write(repo, "lib.py", "def kept():\n    return 2\n");
+    commit_all(repo, "drop gone");
+    let doc = impact(repo, "HEAD~1..HEAD");
+    let callers: Vec<&serde_json::Value> = doc["changed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["symbol"] == "gone")
+        .flat_map(|c| c["callers"].as_array().into_iter().flatten())
+        .collect();
+    let tested = |path: &str| {
+        callers
+            .iter()
+            .find(|c| c["path"] == path)
+            .map(|c| c["tested_by"].clone())
+    };
+    assert_eq!(tested("app.py"), Some("tests/test_app.py".into()), "{doc}");
+    assert_eq!(
+        tested("tests/test_lib.py"),
+        Some("tests/test_lib.py".into()),
+        "{doc}"
+    );
+}
+
+/// #413 (3): a `pub fn` removed from a private module is no removed API; one
+/// removed from a public module is.
+#[test]
+fn a_removed_pub_fn_of_a_private_module_is_no_api() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = tmp.path();
+    init_repo(repo);
+    write(
+        repo,
+        "Cargo.toml",
+        "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(repo, "src/lib.rs", "mod inner;\npub mod api;\n");
+    write(
+        repo,
+        "src/inner.rs",
+        "pub fn hidden() -> u8 {\n    1\n}\n\npub fn stay() -> u8 {\n    2\n}\n",
+    );
+    write(
+        repo,
+        "src/api.rs",
+        "pub fn shown() -> u8 {\n    1\n}\n\npub fn stay() -> u8 {\n    2\n}\n",
+    );
+    commit_all(repo, "base");
+    write(repo, "src/inner.rs", "pub fn stay() -> u8 {\n    2\n}\n");
+    write(repo, "src/api.rs", "pub fn stay() -> u8 {\n    2\n}\n");
+    commit_all(repo, "drop both");
+    let contracts = impact(repo, "HEAD~1..HEAD")["contracts"].to_string();
+    assert!(contracts.contains("src/api.rs"), "{contracts}");
+    assert!(!contracts.contains("src/inner.rs"), "{contracts}");
+}
+
+/// #413 (4): a possible caller yields before a changed contract, and the
+/// header counts every caller found, not the ones that fit.
+#[test]
+fn shedding_drops_guesses_before_contracts_and_the_header_counts_all() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = tmp.path();
+    init_repo(repo);
+    write(
+        repo,
+        "ledger.py",
+        "class Ledger:\n    def reconcile_all(self):\n        return 1\n",
+    );
+    for i in 0..12 {
+        write(
+            repo,
+            &format!("jobs/job_{i}.py"),
+            &format!("def nightly_{i}(ledger):\n    return ledger.reconcile_all()\n"),
+        );
+    }
+    write(
+        repo,
+        "migrations/0002_add.sql",
+        "ALTER TABLE a ADD b int;\n",
+    );
+    commit_all(repo, "base");
+    write(
+        repo,
+        "ledger.py",
+        "class Ledger:\n    def reconcile_all(self):\n        return 2\n",
+    );
+    write(
+        repo,
+        "migrations/0002_add.sql",
+        "ALTER TABLE a ADD c int;\n",
+    );
+    commit_all(repo, "change");
+    let md = impact_budget_md(repo, "100");
+    assert!(md.contains("migrations/0002_add.sql"), "{md}");
+    assert!(md.contains("12 possible"), "{md}");
+}
+
+/// #456: prose and comments the same change wrote about a deletion are its
+/// record of it; a mention outside the change, or a code line it wrote, is
+/// still a stale reference.
+#[test]
+fn the_changes_own_record_of_a_deletion_is_no_stale_reference() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = tmp.path();
+    init_repo(repo);
+    write(repo, "plugin/constraints.txt", "x==1\n");
+    write(repo, "CHANGELOG.md", "# Changes\n");
+    write(repo, "OUTSIDE.md", "Pin with plugin/constraints.txt.\n");
+    write(
+        repo,
+        "tests/test_pub.py",
+        "def test_pub():\n    assert True\n",
+    );
+    write(repo, "tools/load.py", "def load():\n    return 1\n");
+    commit_all(repo, "base");
+    std::fs::remove_file(repo.join("plugin/constraints.txt")).unwrap();
+    write(
+        repo,
+        "CHANGELOG.md",
+        "# Changes\n\n- `plugin/constraints.txt` is gone.\n",
+    );
+    write(
+        repo,
+        "tests/test_pub.py",
+        "# plugin/constraints.txt was the launcher lock\ndef test_pub():\n    assert True\n",
+    );
+    write(
+        repo,
+        "tools/load.py",
+        "def load():\n    return open(\"plugin/constraints.txt\").read()\n",
+    );
+    commit_all(repo, "drop the constraints");
+    let stale: Vec<String> = impact(repo, "HEAD~1..HEAD")["stale_references"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|r| r["path"].as_str().unwrap().to_string())
+        .collect();
+    assert!(stale.contains(&"OUTSIDE.md".to_string()), "{stale:?}");
+    assert!(stale.contains(&"tools/load.py".to_string()), "{stale:?}");
+    assert!(!stale.contains(&"CHANGELOG.md".to_string()), "{stale:?}");
+    assert!(
+        !stale.contains(&"tests/test_pub.py".to_string()),
+        "{stale:?}"
+    );
+}
+
+/// #440: deleting a module of 30 000 definitions searches for every name
+/// at once; passed as arguments they overflowed ARG_MAX, the search failed
+/// and the one real caller was missed.
+#[test]
+fn a_module_of_thirty_thousand_definitions_keeps_its_caller() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = tmp.path();
+    init_repo(repo);
+    // Thirty modules of a thousand: every parse stays well inside its time
+    // budget on a loaded runner, and the one removed-name search still
+    // carries all 30 000 names.
+    write(repo, "pkg/__init__.py", "");
+    for m in 0..30 {
+        let module: String = (m * 1000..(m + 1) * 1000)
+            .map(|i| format!("def generated_function_number_{i:06}():\n    return {i}\n\n"))
+            .collect();
+        write(repo, &format!("pkg/gen_{m:02}.py"), &module);
+    }
+    write(
+        repo,
+        "pkg/consumer.py",
+        "from pkg.gen_29 import generated_function_number_029997\n\n\ndef use():\n    return generated_function_number_029997()\n",
+    );
+    commit_all(repo, "base");
+    for m in 0..30 {
+        std::fs::remove_file(repo.join(format!("pkg/gen_{m:02}.py"))).unwrap();
+    }
+    commit_all(repo, "drop the generated modules");
+    let doc = impact(repo, "HEAD~1..HEAD");
+    assert!(
+        !doc["limits"].to_string().contains("read_failed"),
+        "{}",
+        doc["limits"]
+    );
+    let callers: Vec<String> = doc["changed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|c| c["callers"].as_array().cloned().unwrap_or_default())
+        .map(|c| {
+            format!(
+                "{}::{}",
+                c["path"].as_str().unwrap(),
+                c["symbol"].as_str().unwrap_or("")
+            )
+        })
+        .collect();
+    assert_eq!(callers, vec!["pkg/consumer.py::use"], "{}", doc["limits"]);
+}
+
+/// A private Rust duplicate removed in favour of an imported shared one: its
+/// file and another that import the shared one call that, not the removed
+/// one, and a `use` line is an import, not a reference. A removed `pub fn`
+/// still imported from its own module keeps its caller.
+#[test]
+fn a_removed_private_duplicate_has_no_callers_once_the_shared_one_is_imported() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = tmp.path();
+    init_repo(repo);
+    write(
+        repo,
+        "Cargo.toml",
+        "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(
+        repo,
+        "src/lib.rs",
+        "mod a;\nmod b;\npub mod gone_mod;\nmod shared;\nmod user;\n",
+    );
+    write(
+        repo,
+        "src/shared.rs",
+        "pub(crate) fn absorb(x: u8) -> u8 {\n    x\n}\n",
+    );
+    write(
+        repo,
+        "src/a.rs",
+        "fn absorb(x: u8) -> u8 {\n    x\n}\n\npub fn classify() -> u8 {\n    absorb(1)\n}\n",
+    );
+    write(
+        repo,
+        "src/b.rs",
+        "use crate::shared::absorb;\n\npub fn other() -> u8 {\n    absorb(2)\n}\n",
+    );
+    write(
+        repo,
+        "src/gone_mod.rs",
+        "pub fn gone() -> u8 {\n    3\n}\n\npub fn kept() -> u8 {\n    4\n}\n",
+    );
+    write(
+        repo,
+        "src/user.rs",
+        "use crate::gone_mod::gone;\n\npub fn needs() -> u8 {\n    gone()\n}\n",
+    );
+    commit_all(repo, "base");
+    write(
+        repo,
+        "src/a.rs",
+        "use crate::shared::absorb;\n\npub fn classify() -> u8 {\n    absorb(1)\n}\n",
+    );
+    write(repo, "src/gone_mod.rs", "pub fn kept() -> u8 {\n    4\n}\n");
+    commit_all(repo, "share absorb, drop gone");
+    let doc = impact(repo, "HEAD~1..HEAD");
+    let callers_of = |symbol: &str| -> Vec<String> {
+        doc["changed"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| c["symbol"] == symbol)
+            .flat_map(|c| c["callers"].as_array().cloned().unwrap_or_default())
+            .map(|c| {
+                format!(
+                    "{}:{}",
+                    c["path"].as_str().unwrap(),
+                    c["lines"].as_str().unwrap()
+                )
+            })
+            .collect()
+    };
+    assert_eq!(callers_of("absorb"), Vec::<String>::new(), "{doc}");
+    assert_eq!(callers_of("gone"), vec!["src/user.rs:3-5"], "{doc}");
+}
+
+/// Shedding to fit a budget changes what is listed, never the counts the
+/// header states: callers and their test links are counted whole.
+#[test]
+fn the_header_counts_the_same_at_any_budget() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = tmp.path();
+    init_repo(repo);
+    write(repo, "core.py", "def rate(x):\n    return x * 2\n");
+    for i in 0..8 {
+        write(
+            repo,
+            &format!("use_{i}.py"),
+            &format!("from core import rate\n\n\ndef caller_{i}(x):\n    return rate(x) + {i}\n"),
+        );
+    }
+    for i in 0..4 {
+        write(
+            repo,
+            &format!("tests/test_use_{i}.py"),
+            &format!(
+                "from use_{i} import caller_{i}\n\n\ndef test_caller_{i}():\n    assert caller_{i}(1)\n"
+            ),
+        );
+    }
+    commit_all(repo, "base");
+    write(repo, "core.py", "def rate(x):\n    return x * 3\n");
+    commit_all(repo, "change");
+    let header = |budget: &str| {
+        impact_budget_md(repo, budget)
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let whole = header("20000");
+    assert!(
+        whole.contains("8 caller(s)") && whole.contains("4 without a static test link"),
+        "{whole}"
+    );
+    assert_eq!(header("90"), whole);
+}
+
+/// #496: a Java method calling a sibling of its own class with no
+/// qualifier is a caller; a comment naming it and a call through another
+/// receiver are not.
+#[test]
+fn an_unqualified_same_class_java_call_is_a_caller() {
+    let mapper = "package app;\n\npublic class Mapper {\n    static int map(int x) {\n        return x * 2;\n    }\n\n    public int toDto(int x) {\n        return map(x) + 1;\n    }\n\n    public int noted(int x) {\n        // map(x) is not called here\n        return other.map(x);\n    }\n}\n";
+    let tmp = repo_of(
+        &[
+            ("src/main/java/app/Mapper.java", mapper),
+            (
+                "src/test/java/app/MapperTest.java",
+                "package app;\n\npublic class MapperTest {\n    void testIt() {\n        new Mapper().toDto(1);\n    }\n}\n",
+            ),
+        ],
+        &[(
+            "src/main/java/app/Mapper.java",
+            &mapper.replace("x * 2", "x * 3"),
+        )],
+    );
+    let doc = impact(tmp.path(), "HEAD~1..HEAD");
+    let callers: Vec<String> = doc["changed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["symbol"] == "map")
+        .flat_map(|c| c["callers"].as_array().cloned().unwrap_or_default())
+        .map(|c| c["symbol"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(callers, vec!["toDto"], "{doc}");
+}
+
+/// #484: a file over the size cap is never read, so its calls are not seen;
+/// when it names the changed definition, the answer says so instead of
+/// reading as complete.
+#[test]
+fn a_namer_over_the_size_cap_is_named_as_a_possible_caller() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = tmp.path();
+    init_repo(repo);
+    let body: String = (0..25)
+        .map(|j| format!("    let v{j} = x + {j};\n"))
+        .collect();
+    let filler: String = (0..300)
+        .map(|i| format!("pub fn filler_{i}(x: u32) -> u32 {{\n{body}    x\n}}\n\n"))
+        .collect();
+    write(
+        repo,
+        "Cargo.toml",
+        "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(
+        repo,
+        "src/lib.rs",
+        "pub mod big;\npub mod small;\npub mod testfiles;\n",
+    );
+    write(
+        repo,
+        "src/testfiles.rs",
+        "pub fn is_test_path(p: &str) -> bool {\n    p.contains(\"test\")\n}\n",
+    );
+    write(
+        repo,
+        "src/big.rs",
+        &format!(
+            "{filler}pub fn uses_it(p: &str) -> bool {{\n    crate::testfiles::is_test_path(p)\n}}\n"
+        ),
+    );
+    write(
+        repo,
+        "src/small.rs",
+        "pub fn small_use(p: &str) -> bool {\n    crate::testfiles::is_test_path(p)\n}\n",
+    );
+    commit_all(repo, "base");
+    write(
+        repo,
+        "src/testfiles.rs",
+        "pub fn is_test_path(p: &str) -> bool {\n    p.contains(\"tests\")\n}\n",
+    );
+    commit_all(repo, "change");
+    let md = impact_markdown(repo, "HEAD~1..HEAD");
+    assert!(md.contains("src/big.rs (over the size cap)"), "{md}");
+    assert!(md.contains("called from src/small.rs::small_use"), "{md}");
+}
+
+/// #521: a shell script the grammar cannot parse is no hedge on a JS
+/// function it cannot call; a JS file that breaks the parse still is.
+#[test]
+fn a_broken_parse_hedges_only_callers_of_its_own_runtime() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = tmp.path();
+    init_repo(repo);
+    write(
+        repo,
+        "lib.mjs",
+        "export function helper() {\n  return 1;\n}\n",
+    );
+    write(
+        repo,
+        "a.sh",
+        "#!/bin/bash\n: \"${SEL:=input[type=\\\"text\\\"], input[type=\\\"email\\\"]}\"\necho \"$SEL\" helper\n",
+    );
+    commit_all(repo, "base");
+    write(
+        repo,
+        "lib.mjs",
+        "export function helper() {\n  return 2;\n}\n",
+    );
+    commit_all(repo, "change");
+    let md = impact_markdown(repo, "HEAD~1..HEAD");
+    assert!(!md.contains("a.sh"), "{md}");
+
+    write(
+        repo,
+        "broken.mjs",
+        "import { helper } from \"./lib.mjs\";\nexport function use( {\n  return helper();\n}\n",
+    );
+    commit_all(repo, "a broken caller");
+    write(
+        repo,
+        "lib.mjs",
+        "export function helper() {\n  return 3;\n}\n",
+    );
+    commit_all(repo, "change again");
+    let md = impact_markdown(repo, "HEAD~1..HEAD");
+    assert!(md.contains("broken.mjs"), "{md}");
+}
+
+/// #391: a local closure named like a changed function is called by its
+/// own fragment, not the function; a call that names the function still is.
+#[test]
+fn a_local_closure_named_like_a_definition_is_no_caller() {
+    let a = "pub fn read() -> u8 {\n    1\n}\n";
+    let tmp = repo_of(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "pub mod a;\npub mod b;\npub mod c;\n"),
+            ("src/a.rs", a),
+            (
+                "src/b.rs",
+                "pub fn is_pub(x: u8) -> u8 {\n    let read = |p: u8| p + 1;\n    read(x)\n}\n",
+            ),
+            (
+                "src/c.rs",
+                "pub fn real() -> u8 {\n    crate::a::read()\n}\n",
+            ),
+        ],
+        &[("src/a.rs", &a.replace("    1\n", "    2\n"))],
+    );
+    let doc = impact(tmp.path(), "HEAD~1..HEAD");
+    let callers: Vec<String> = doc["changed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["symbol"] == "read")
+        .flat_map(|c| c["callers"].as_array().cloned().unwrap_or_default())
+        .map(|c| c["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(callers, vec!["src/c.rs"], "{doc}");
+}

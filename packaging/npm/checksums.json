@@ -1,8 +1,8 @@
 {
-  "diffctx-1.18.4-aarch64-apple-darwin.tar.gz": "3e9c14ead118b7099bbafb1f106c8cfd141070712568107cf27f9510ac0b4991",
-  "diffctx-1.18.4-aarch64-pc-windows-msvc.zip": "dcd47a7019f306421330275b30e3773ad47a75f226e2f308b66b50bc33fbd765",
-  "diffctx-1.18.4-aarch64-unknown-linux-gnu.tar.gz": "d2e73658ec0630c3b37f198073c5634b9ab4d921d25cb6c0f2671e529f24140b",
-  "diffctx-1.18.4-x86_64-apple-darwin.tar.gz": "b44e0f7c2358c1a27067e03c0e2a66b2b97974cc658081f75ed5516a7b9d4d43",
-  "diffctx-1.18.4-x86_64-pc-windows-msvc.zip": "e02611f54c1bbd5ef5cf7c8c9b8ca8256b2787bf645dfc52136f8e325c38b940",
-  "diffctx-1.18.4-x86_64-unknown-linux-gnu.tar.gz": "b345f7e654d5accbb6f8bfdb931b37c22b6de70e2ceac921ab9dd1f661fed9dd"
+  "diffctx-1.19.0-aarch64-apple-darwin.tar.gz": "24b89ffeca5dd886c4be3358b3272867bf1d9d0aa1ab49c944aa8ae9eca1dc6c",
+  "diffctx-1.19.0-aarch64-pc-windows-msvc.zip": "7b938e3a5315703fae532e565fc1d715d2417db656815f52f1affa4a0ea2e7f2",
+  "diffctx-1.19.0-aarch64-unknown-linux-gnu.tar.gz": "93b11dbea87dd4025a231549c7dc8704e98145cc8fbd3eb1790bd7f73aea7170",
+  "diffctx-1.19.0-x86_64-apple-darwin.tar.gz": "af7cb854ba052e0b90cd8de3f6e9c8a49edf971c241a9f124f5de48b2c8771f5",
+  "diffctx-1.19.0-x86_64-pc-windows-msvc.zip": "1e1564eb15cf8278289fa032a5d79327eef9f5a580c1f1d2b5702dda21411426",
+  "diffctx-1.19.0-x86_64-unknown-linux-gnu.tar.gz": "9c081d058121ae68f6af6f453711e7549f696044bfb1e988d3853678d64d39cf"
 }

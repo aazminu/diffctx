@@ -1840,50 +1840,54 @@ fn an_unwritable_cache_still_reviews_a_change_once() {
 /// commit reads as this one's.
 #[test]
 fn a_push_after_a_pull_on_the_same_line_reviews_only_what_it_sent() {
-    let tmp = repo_with_pending_change();
-    let repo = tmp.path();
-    let remote = TempDir::new().unwrap();
-    git(remote.path(), &["init", "-q", "--bare", "."]);
-    git(
-        repo,
-        &["remote", "add", "origin", &remote.path().to_string_lossy()],
-    );
-    git(repo, &["stash", "-q"]);
-    git(repo, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
-    git(repo, &["fetch", "-q", "origin"]);
-    // Another session pushes a restock change.
-    let other = TempDir::new().unwrap();
-    git(
-        other.path(),
-        &[
-            "clone",
-            "-q",
-            "-b",
-            "main",
-            &remote.path().to_string_lossy(),
-            ".",
-        ],
-    );
-    git(other.path(), &["config", "user.email", "test@example.com"]);
-    git(other.path(), &["config", "user.name", "diffctx tests"]);
-    add_unrelated_edit(other.path());
-    commit_all(other.path(), "restock elsewhere");
-    git(other.path(), &["push", "-q", "origin", "HEAD:main"]);
-    // This session commits its own change, then lands it.
-    git(repo, &["stash", "pop", "-q"]);
-    commit_all(repo, "vat");
-    let cache = TempDir::new().unwrap();
-    let h = run_line(
-        repo,
-        cache.path(),
+    // The reopened shape lists the fetched commits first, then rebases.
+    for line in [
         "git pull -q --rebase origin main && git push -q origin HEAD:main",
-    );
-    let context = context_of(&h);
-    assert!(context.contains("shop/checkout.py::charge"), "{context}");
-    assert!(
-        !context.contains("shop/shelf.py"),
-        "the other session's restock was pulled, not pushed: {context}"
-    );
+        "git fetch -q origin && git log --oneline HEAD..origin/main && git rebase -q origin/main && git push -q origin HEAD:main",
+    ] {
+        let tmp = repo_with_pending_change();
+        let repo = tmp.path();
+        let remote = TempDir::new().unwrap();
+        git(remote.path(), &["init", "-q", "--bare", "."]);
+        git(
+            repo,
+            &["remote", "add", "origin", &remote.path().to_string_lossy()],
+        );
+        git(repo, &["stash", "-q"]);
+        git(repo, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        git(repo, &["fetch", "-q", "origin"]);
+        // Another session pushes a restock change.
+        let other = TempDir::new().unwrap();
+        git(
+            other.path(),
+            &[
+                "clone",
+                "-q",
+                "-b",
+                "main",
+                &remote.path().to_string_lossy(),
+                ".",
+            ],
+        );
+        git(other.path(), &["config", "user.email", "test@example.com"]);
+        git(other.path(), &["config", "user.name", "diffctx tests"]);
+        add_unrelated_edit(other.path());
+        commit_all(other.path(), "restock elsewhere");
+        git(other.path(), &["push", "-q", "origin", "HEAD:main"]);
+        // This session commits its own change, then lands it.
+        git(repo, &["stash", "pop", "-q"]);
+        commit_all(repo, "vat");
+        let cache = TempDir::new().unwrap();
+        let context = context_of(&run_line(repo, cache.path(), line));
+        assert!(
+            context.contains("shop/checkout.py::charge"),
+            "{line}: {context}"
+        );
+        assert!(
+            !context.contains("shop/shelf.py"),
+            "{line}: the other session's restock was fetched, not pushed: {context}"
+        );
+    }
 }
 
 /// #448: a name defined only in an untracked file is the pending change's
@@ -1913,4 +1917,60 @@ fn a_search_for_a_name_defined_in_an_untracked_file_is_answered() {
     let context = context_of(&h);
     assert!(context.contains("`convert`"), "{context}");
     assert!(context.contains("main.py::run"), "{context}");
+}
+
+/// #486: `git grep PATTERN REV -- PATH` names a revision before `--`; it is
+/// no directory, and the search is answered like any other.
+#[test]
+fn a_git_grep_over_a_revision_is_answered() {
+    let tmp = repo_with_pending_change();
+    let cache = TempDir::new().unwrap();
+    let repo = tmp.path();
+    let h = hook_with(
+        repo,
+        cache.path(),
+        "posttooluse",
+        &[],
+        &search_payload(repo, "Bash", r"git grep -n 'def total(' HEAD -- shop/"),
+    );
+    assert_eq!(h.code, Some(0));
+    let context = output_of(&h, "PostToolUse")["additionalContext"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(context.contains("shop/checkout.py::charge"), "{context}");
+    let log = std::fs::read_to_string(cache.path().join("diffctx/hook.log")).unwrap();
+    assert!(!log.contains("not-git"), "{log}");
+}
+
+/// #402: a qualified chain in a search pattern searches for its last name;
+/// `total.rate` is no search for the edited `total`, while an alternation
+/// branch that names it still is.
+#[test]
+fn a_qualified_search_word_is_not_the_name_it_qualifies() {
+    let tmp = repo_with_pending_change();
+    let repo = tmp.path();
+    let answer = |query: &str| {
+        let cache = TempDir::new().unwrap();
+        let h = hook_with(
+            repo,
+            cache.path(),
+            "posttooluse",
+            &[],
+            &search_payload(repo, "Bash", query),
+        );
+        assert_eq!(h.code, Some(0));
+        h.stdout
+    };
+    assert_eq!(answer(r"grep -rn 'total\.rate' shop/"), "");
+    assert_eq!(answer("grep -rn 'total.rate' shop/"), "");
+    assert_eq!(
+        answer("grep -rn 'for (cart, total) in rows' shop/"),
+        "",
+        "a line of code names several identifiers, not one"
+    );
+    assert!(
+        answer(r"grep -rn 'cart.rate\|def total' shop/").contains("shop/checkout.py::charge"),
+        "an alternation branch naming `total` is a search for it"
+    );
 }

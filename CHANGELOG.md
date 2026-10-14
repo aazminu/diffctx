@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Go callers come from syntax facts: a package is its directory, an import
+  binds it by the path `go.mod` gives it, an alias or a dot import names it,
+  an unexported name never leaves its package, and a method call resolves
+  when the syntax states the value's type (a receiver, a parameter,
+  `x := &pkg.T{}`). A same-named function of another package, a struct
+  field, a local and a string are no longer callers (#506).
+
+### Fixed
+
+- Module-level calls are listed beside a function-level caller in the same
+  file (#449), and a caller split into chunks spans every call site (#472).
+- A call inside a function's local `const` names the function as the caller,
+  with its test link, not the local (#452).
+- `async function` and generator functions are JS/TS definitions: a call
+  from the same file read as "nothing calls them" (#481).
+- Shell functions are called from their own script's body and from scripts
+  that source them; a script calling its own `run_tool` read as no caller
+  (#497).
+- Callers of a removed definition keep their test links; a removed `pub fn`
+  of a private Rust module or a binary is no removed API; possible callers
+  are shed before contracts, and the header counts every caller found and
+  every one without a test link at any budget (#413).
+- `--full` reads under the run's deadline and names it, instead of exiting
+  with "files over the size cap" when a git read stalls (#439).
+- A tree the hook builds from the session's edits is "the snapshot tree",
+  not "staged changes"; prose beside migrations is no schema contract; the
+  hook asks to check callers only when it lists some (#463).
+- `selftest*` files are tests (#428).
+- Deleting a module of tens of thousands of definitions no longer overflows
+  the argument list of the name search: the names go to `git grep` through a
+  pattern file, and the callers are found instead of a failed read (#440).
+- The search hook reads `git grep PATTERN REV -- PATH`'s revision as one,
+  not as a directory outside any repository (#486), and a qualified search
+  word (`tests.direct`) searches for its last name, not its qualifier
+  (#402).
+- A line the change itself wrote about a deletion (a changelog entry, a
+  comment) is no stale reference, and a path that ends a sentence still is
+  one (#456).
+- A private Rust function removed in favour of an imported shared one has
+  no callers: a private item is reachable only from its own module and the
+  modules beneath it, a `use` from another module binds a file's calls
+  there, and a `use` line is no reference (#519).
+- The search hook answers a pattern branch only when it names exactly one
+  identifier: a grep for a line of code is no search for each of its words
+  (#402).
+- A changed constructor (`__init__`, `constructor`) is called by its
+  class's name: `cp.Model(…)`, `Model(…)` and `new Store(…)` are its callers
+  (#318).
+- JS/TS class methods, object-literal methods and a store's actions built
+  inside `create(...)` are definitions with callers — through `this`, a typed
+  instance, the object, or possibly any receiver (#444, #473); a call wrapped
+  in parentheses at module level is a caller, and a call inside an anonymous
+  arrow belongs to the definition around it (#520); a component reached
+  through `lazy(() => import(…))` or `await import(…)` is referenced there
+  (#479); a workspace package's specifier (`@scope/core`) resolves into its
+  source (#474).
+- Python: a pytest fixture is called by the tests and fixtures that take it
+  as a parameter (#401); an `Any` receiver and an object from a factory
+  classmethod are possible callers (#425).
+- Java: a method calling a sibling of its own class with no qualifier is a
+  caller (#496). Rust: a local closure named like a changed function is no
+  caller of it (#391).
+- A file over the size cap that names a changed definition is said as a
+  place callers may be missing, instead of the answer reading complete
+  (#484); a file of another runtime that breaks its parse is no such hedge
+  (#521).
+- A hand-written "do not edit" header no longer marks a file generated;
+  a generator's header still does (#411).
+- The native CLI refuses `--symbol` with another `--mode` named outright,
+  reads `PATH` in `--symbol PATH:NAME` from the path it was given, and parses
+  the watchdog override as the Python CLI does (#410).
+- A file that declares a removed definition's name itself calls its own,
+  not the removed one: deleting a private `declared_name` in one Rust file
+  listed another file's calls to its own `declared_name` as broken callers.
+
 ## [1.19.0] - 2026-10-14
 
 ### Added

@@ -80,7 +80,7 @@ config/yaml/yaml_003_logging_config
 config/yaml/yaml_012_queue_config
 # Builder load-bearing cases whose gold is reachable only through the
 # builder's edge. The edge exists (locate names it); the selection drops it —
-# Q-class, frozen during the v3 evaluation cycle. Each line is the measured cause.
+# selection fixes not made yet. Each line is the measured cause.
 # Path-only import target is not naming-reachable, so it can enter only via the
 # rescue post-pass, capped at 5% of the budget; at the corpus budget the
 # fragment is larger than that share (passes with DIFFCTX_OP_RESCUE_BUDGET_FRACTION=0.5).

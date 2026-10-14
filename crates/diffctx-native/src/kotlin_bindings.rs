@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::bindings::{Evidence, Finding, Relation};
+use crate::bindings::{Evidence, Finding, Relation, absorb};
 use crate::facts::kotlin::{
     Declaration, InitCall, KotlinFacts, Receiver, Use, UseKind, Visibility,
 };
@@ -1024,31 +1024,5 @@ fn relation_of(u: &Use, def: &KDef) -> Option<Relation> {
             Some(Relation::Reference)
         }
         _ => None,
-    }
-}
-
-fn absorb(best: &mut Option<Finding>, evidence: Evidence, relation: Relation, line: u32) {
-    let rank = |e: Evidence| match e {
-        Evidence::Rejected => 0,
-        Evidence::Candidate(_) => 1,
-        Evidence::Resolved => 2,
-    };
-    match best {
-        Some(b) if rank(b.evidence) > rank(evidence) => {}
-        Some(b) if rank(b.evidence) == rank(evidence) => {
-            if relation == Relation::Call {
-                b.relation = Relation::Call;
-            }
-            if !b.lines.contains(&line) {
-                b.lines.push(line);
-            }
-        }
-        _ => {
-            *best = Some(Finding {
-                evidence,
-                relation,
-                lines: vec![line],
-            });
-        }
     }
 }

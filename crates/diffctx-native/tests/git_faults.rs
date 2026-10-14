@@ -642,3 +642,27 @@ fn every_failing_git_read_is_an_error_or_a_named_loss() {
     }
     fx.assert_no_survivors();
 }
+
+/// #439: `--full` reads only the changed files, and a stalled read of them
+/// is a deadline the answer names — not "files over the size cap".
+#[test]
+fn a_stalled_full_read_names_the_deadline() {
+    let fx = fixture();
+    let (out, elapsed) = fx.pack("cat-file", "stall_before_read", &["--full"]);
+    assert!(elapsed < BOUND, "took {elapsed:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("over the size cap"), "{stderr}");
+    let named = stderr.contains("deadline")
+        || stderr.contains("timeout")
+        || serde_json::from_slice::<serde_json::Value>(&out.stdout).is_ok_and(|doc| {
+            doc["coverage"]["limit_reasons"]
+                .to_string()
+                .contains("deadline")
+        });
+    assert!(
+        named,
+        "stdout={} stderr={stderr}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    fx.assert_no_survivors();
+}

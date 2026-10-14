@@ -67,6 +67,7 @@ pub static EDGE_WEIGHTS: Lazy<FxHashMap<&'static str, EdgeWeightConfig>> = Lazy:
         ("php_type", EdgeWeightConfig::new(0.55, 0.40)),
         ("shell_source", EdgeWeightConfig::new(0.60, 0.35)),
         ("shell_script", EdgeWeightConfig::new(0.50, 0.35)),
+        ("shell_call", EdgeWeightConfig::new(0.55, 0.35)),
         ("swift_import", EdgeWeightConfig::new(0.65, 0.40)),
         ("swift_conformance", EdgeWeightConfig::new(0.70, 0.40)),
         ("swift_extension", EdgeWeightConfig::new(0.65, 0.40)),

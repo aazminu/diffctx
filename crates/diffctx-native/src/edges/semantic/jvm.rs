@@ -72,6 +72,9 @@ static SCALA_CLASS_RE: Lazy<Regex> = Lazy::new(|| {
 static TYPE_REF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b([A-Z]\w*)\b").unwrap());
 static ANNOTATION_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"@([A-Z]\w*)").unwrap());
 static MEMBER_USE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\.\s*([a-zA-Z_]\w{2,})").unwrap());
+/// A call with no receiver: `map(x)`, never `.map(x)` or `obj.map(x)`.
+static UNQUALIFIED_CALL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?:^|[^.\w$])([a-zA-Z_]\w{2,})\s*\(").unwrap());
 /// `UI.DP`: a member too short for the bare channel, spelled with its owner.
 static QUALIFIED_SHORT_USE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\b([A-Z]\w*)\s*\.\s*([A-Za-z_]\w?)\b").unwrap());
@@ -863,6 +866,28 @@ impl EdgeBuilder for JVMEdgeBuilder {
                         continue;
                     }
                     if rel.confirmed(jf.path(), dst_path) {
+                        add_edge(&mut edges, &jf.id, d, member_weight, reverse_factor);
+                    }
+                }
+            }
+            // A Java method calls a sibling of its own file with no
+            // qualifier — `map(x)` in `toDto` — which the dotted member uses
+            // never see (#496). Scala's `apply` and paren-less calls make a
+            // bare name no such call.
+            let java = jf.path().ends_with(".java");
+            let code = crate::parsers::code_only(jf.path(), &jf.content)
+                .filter(|_| java)
+                .unwrap_or_default();
+            for cap in UNQUALIFIED_CALL_RE.captures_iter(&code) {
+                let m = cap[1].to_lowercase();
+                if own.as_deref() == Some(m.as_str()) {
+                    continue;
+                }
+                for d in member_defs.get(&m).into_iter().flatten() {
+                    if d.path.as_ref() == jf.path()
+                        && d != &jf.id
+                        && !(d.start_line <= jf.id.start_line && d.end_line >= jf.id.end_line)
+                    {
                         add_edge(&mut edges, &jf.id, d, member_weight, reverse_factor);
                     }
                 }

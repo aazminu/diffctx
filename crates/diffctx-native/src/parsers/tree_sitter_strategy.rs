@@ -42,6 +42,7 @@ const LANG_CONFIGS: &[LangConfig] = &[
         ts_name: "javascript",
         definition_types: &[
             "function_declaration",
+            "generator_function_declaration",
             "class_declaration",
             "method_definition",
             "arrow_function",
@@ -53,6 +54,7 @@ const LANG_CONFIGS: &[LangConfig] = &[
         ts_name: "jsx",
         definition_types: &[
             "function_declaration",
+            "generator_function_declaration",
             "class_declaration",
             "method_definition",
             "arrow_function",
@@ -64,6 +66,7 @@ const LANG_CONFIGS: &[LangConfig] = &[
         ts_name: "typescript",
         definition_types: &[
             "function_declaration",
+            "generator_function_declaration",
             "class_declaration",
             "method_definition",
             "arrow_function",
@@ -78,6 +81,7 @@ const LANG_CONFIGS: &[LangConfig] = &[
         ts_name: "tsx",
         definition_types: &[
             "function_declaration",
+            "generator_function_declaration",
             "class_declaration",
             "method_definition",
             "arrow_function",
@@ -1193,6 +1197,17 @@ fn extract_symbol_name(node: &Node, source: &[u8]) -> Option<String> {
                 return std::str::from_utf8(text).ok().map(|s| s.to_string());
             }
         }
+    }
+    // `key: (x) => {…}` in an object literal — a store's action, a handler
+    // map — is named by its property (#473).
+    if FUNCTION_CHILD_TYPES.contains(&unwrapped.kind()) || unwrapped.kind() == "function_expression"
+    {
+        let key = unwrapped
+            .parent()
+            .filter(|p| p.kind() == "pair")?
+            .child_by_field_name("key")?;
+        let text = std::str::from_utf8(&source[key.byte_range()]).ok()?;
+        return Some(text.trim_matches(['"', '\'']).to_string());
     }
     None
 }

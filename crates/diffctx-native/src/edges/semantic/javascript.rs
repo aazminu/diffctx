@@ -32,19 +32,19 @@ fn is_ts_file(path: &Path) -> bool {
 
 static IMPORT_SOURCE_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"(?m)(?:import\s+.*?\s+from\s+['"]([^'"]+)['"]|require\s*\(\s*['"]([^'"]+)['"]\s*\))"#,
+        r#"(?m)(?:import\s+.*?\s+from\s+['"]([^'"]+)['"]|require\s*\(\s*['"]([^'"]+)['"]\s*\)|\bimport\s*\(\s*['"]([^'"]+)['"]\s*\))"#,
     )
     .unwrap()
 });
 static EXPORT_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\s*export\s+(?:default\s+)?(?:function|class|const|let|var|interface|type|enum|abstract\s+class)\s+([A-Za-z_$]\w*)").unwrap()
+    Regex::new(r"(?m)^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function(?:\s*\*\s*|\s+)|(?:class|const|let|var|interface|type|enum|abstract\s+class)\s+)([A-Za-z_$]\w*)").unwrap()
 });
 static NAMED_IMPORT_NAMES_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?m)import\s*\{([^}]+)\}\s*from").unwrap());
 static CALL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b([A-Za-z_$]\w*)\s*\(").unwrap());
 static TYPE_REF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b([A-Z]\w*)\b").unwrap());
 static DEF_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\s*(?:export\s+)?(?:default\s+)?(?:function|class|const|let|var|interface|type|enum)\s+([A-Za-z_$]\w*)").unwrap()
+    Regex::new(r"(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function(?:\s*\*\s*|\s+)|(?:class|const|let|var|interface|type|enum)\s+)([A-Za-z_$]\w*)").unwrap()
 });
 
 static JS_KEYWORDS: Lazy<FxHashSet<&str>> = Lazy::new(|| {
@@ -59,10 +59,7 @@ static JS_KEYWORDS: Lazy<FxHashSet<&str>> = Lazy::new(|| {
 fn extract_import_sources(content: &str) -> FxHashSet<String> {
     let mut sources = FxHashSet::default();
     for cap in IMPORT_SOURCE_RE.captures_iter(content) {
-        if let Some(m) = cap.get(1) {
-            sources.insert(m.as_str().to_string());
-        }
-        if let Some(m) = cap.get(2) {
+        for m in [cap.get(1), cap.get(2), cap.get(3)].into_iter().flatten() {
             sources.insert(m.as_str().to_string());
         }
     }
@@ -137,7 +134,18 @@ impl EdgeBuilder for JavaScriptEdgeBuilder {
         let mut frag_defines: FxHashMap<FragmentId, FxHashSet<String>> = FxHashMap::default();
 
         for f in &js_frags {
-            let defines = extract_defines(&f.content);
+            let mut defines = extract_defines(&f.content);
+            // A class or object-literal method is a fragment the grammar
+            // named; no declaration keyword spells it (#444, #473).
+            if f.kind == crate::types::FragmentKind::Function {
+                if let Some(name) = f.symbol_name.as_deref() {
+                    let name = name.split('[').next().unwrap_or(name);
+                    let name = name.rsplit('.').next().unwrap_or(name);
+                    if !name.is_empty() {
+                        defines.insert(name.to_string());
+                    }
+                }
+            }
             for name in &defines {
                 name_to_defs
                     .entry(name.clone())

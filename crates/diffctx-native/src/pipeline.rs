@@ -863,10 +863,21 @@ fn resolve_symbol_change_set(
     let full = segments.join(".");
     let name = *segments.last().expect("split yields one segment");
     let qualifier = segments.len().checked_sub(2).map(|i| segments[i]);
+    // `PATH` is read from the path the run was given, as a shell user reads
+    // it: `cd src && diffctx . --symbol a.rs:build` names `src/a.rs`, and
+    // `diffctx sub/ --symbol x.py:f` stays inside `sub/` (#410).
     let pathspec: Vec<String> = match path {
-        Some(p) => vec![crate::paths::to_posix_display(std::borrow::Cow::Borrowed(
-            p,
-        ))],
+        Some(p) => {
+            let p = crate::paths::to_posix_display(std::borrow::Cow::Borrowed(p));
+            if scope.is_empty() {
+                vec![p]
+            } else {
+                scope
+                    .iter()
+                    .map(|s| format!("{}/{p}", s.trim_end_matches('/')))
+                    .collect()
+            }
+        }
         None => scope.to_vec(),
     };
     let named = git::grep_files_with_word(root_dir, name, &pathspec)?;
@@ -2518,8 +2529,6 @@ fn build_diff_context_full(
     no_content: bool,
     timeout: u64,
 ) -> Result<DiffContextOutput> {
-    // --full runs no scoring/edge phase, so the git subprocess timeout is the
-    // only ceiling it needs.
     git::set_git_timeout(timeout);
     let (root_dir, scope) = resolve_scope(root_dir, paths)?;
     let resolved = git::resolve_duration_range(&root_dir, diff_range)?;
@@ -2565,7 +2574,9 @@ fn build_diff_context_full(
     let preferred_revs = build_preferred_revs(base_rev.as_deref(), head_rev.as_deref());
     let mut seen_frag_ids: FxHashSet<FragmentId> = FxHashSet::default();
     let mut batch_reader = CatFileBatch::new(&root_dir)?;
-    let run = crate::resource::RunContext::unbounded();
+    // Reading the changed files is bounded like every other run: a deadline
+    // that cuts it is named, not reported as files over the size cap (#439).
+    let run = crate::resource::RunContext::for_run(timeout);
     run.set_source(crate::source::Source::for_range(&root_dir, diff_range)?);
     let _in_run = run.enter();
     let mut all_fragments = crate::fragmentation::fragment_files(
@@ -2615,7 +2626,8 @@ fn build_diff_context_full(
         ignored_changes: withheld.ignored_changes,
         policy_excluded_count: withheld.policy_excluded_count,
     };
-    Ok(render::build_diff_context_output(
+    let changed_display: FxHashSet<String> = change.changed_files.iter().cloned().collect();
+    let mut output = render::build_diff_context_output(
         &root_dir,
         &selected,
         no_content,
@@ -2624,7 +2636,10 @@ fn build_diff_context_full(
         &FxHashSet::default(),
         &FxHashMap::default(),
         change,
-    ))
+    );
+    output.coverage =
+        crate::resource::CoverageReport::build(&run, &[], &|p| changed_display.contains(p));
+    Ok(output)
 }
 
 fn deletion_rename_displays(

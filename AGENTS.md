@@ -17,28 +17,36 @@ Setup, suite shape and the per-case YAML corpus gate
 (`crates/diffctx-native/tests/known_below_threshold.txt`, bidirectional: a
 listed case that starts passing also fails) are in `CONTRIBUTING.md`.
 
-## Performance changes: E-class or Q-class
+## Output-changing changes are judged by correctness
 
-Every change is **E-class** (identical selection output on identical input) or
-**Q-class** (output-changing). Q-class changes are frozen during an evaluation
-cycle (calibration → validation → sweep), because they invalidate the
-calibration and force a full rerun. The shared token corpus, the per-blob token
-cache and the two-pass edge cap were E-class; fragmentation and scoring changes
-are Q-class.
+A change either keeps selection output identical (E-class) or moves it
+(Q-class). Neither is frozen: the algorithm is meant to improve, and the
+project is not bound to the paper's numbers. The question for an
+output-changing fix is whether the new output is right — shown on a fixture
+whose right answer is known, and by reading each corpus case that flips,
+never by its byte distance from the old output.
 
-- **Per commit:** `scripts/bitcheck.sh record` on the pre-change build, `check`
-  after — 24 cells against a worktree pinned at a fixed SHA, so editing the code
-  cannot edit the input. It drives the native binary and says nothing about
-  `writer.py`, `_native/` or `mcp/`; a Python-side E-class claim needs its own
-  byte-diff through the installed wheel. The full corpus
-  (`cargo test --release --test yaml_cases`) is the only net over the
-  per-language edge and parser tables bitcheck never reaches.
-- **Per release:** `python -m eval equivalence --a <old-run> --b <new-run>` on
-  the stratified 40-instance sample (`results/sweep_v2_local/equiv/manifests`)
-  plus a double-run determinism check. It needs two full eval outputs and a
-  local `results/` tree, so no CI job runs it.
+- **A claimed pure refactor** cites `scripts/bitcheck.sh` (`record` on the
+  pre-change build, `check` after: 24 cells against a worktree pinned at a
+  fixed SHA). It drives the native binary only; `writer.py`, `_native/` and
+  `mcp/` need their own byte-diff through the installed wheel.
+- **The full corpus** (`cargo test --release --test yaml_cases`) is the only
+  net over the per-language edge and parser tables; a fix that flips cases
+  reads them and edits the bidirectional baseline in the same commit.
+- **Per release, optionally:** `python -m eval equivalence --a <old> --b
+  <new>` on the stratified 40-instance sample (needs two full eval outputs and
+  a local `results/` tree, so no CI job runs it).
 
 ## Reading test and oracle results
+
+- **A test never times the run.** A wall-clock bound is green on a laptop and
+  red on a loaded CI runner (a 2.5 s gate measured 2.8 s on Linux and 5.5 s on
+  Windows). Stop a run with `DIFFCTX_TEST_DEADLINE_EXPIRED=1` or
+  `DIFFCTX_TEST_DEADLINE_AFTER_POLLS=n` and assert what it read or named.
+- **A test that clones a bare remote names the branch** (`clone -b main`):
+  CI's git defaults to `master`, so the clone comes up empty and the push is
+  rejected, while a laptop's `init.defaultBranch=main` hides it. Prove such a
+  test under `GIT_CONFIG_GLOBAL=/dev/null`.
 
 - **Garbage injection is opt-in.** Only the few YAML cases that set
   `fixtures.auto_garbage` get unrelated `GARBAGE_*` files and the leak assertion

@@ -27,7 +27,8 @@ use std::path::Path;
 const TEST_DIRS: &[&str] = &["test", "tests", "__tests__", "spec", "specs"];
 
 /// Segment markers, compared case-insensitively against a whole segment.
-const SEGMENT_MARKERS: &[&str] = &["test", "tests", "spec", "specs"];
+/// `selftest` is a tool's own suite (`selftest.mjs`, `lib-selftest.mjs`, #428).
+const SEGMENT_MARKERS: &[&str] = &["test", "tests", "spec", "specs", "selftest", "selftests"];
 
 /// CamelCase markers, compared against the original case — the capital letter
 /// *is* the word boundary.

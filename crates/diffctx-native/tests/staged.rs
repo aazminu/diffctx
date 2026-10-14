@@ -511,3 +511,38 @@ fn full_over_a_range_never_shows_a_deleted_or_renamed_away_body() {
     assert!(!paths.contains(&"shop/checkout.py"), "{paths:?}");
     assert!(!paths.contains(&"shop/billing.py"), "{paths:?}");
 }
+
+/// #463: a tree its caller built (the hook's edited set) is named as the
+/// tree it is, not as the staged changes; prose beside the migrations is no
+/// schema contract.
+#[test]
+fn a_built_tree_is_no_staged_change_and_migration_prose_no_schema() {
+    let tmp = shop();
+    let repo = tmp.path();
+    write(repo, "shop/pricing.py", TOTAL_CHANGED);
+    write(
+        repo,
+        "db/migration/PLAN.md",
+        "| step | table |\n| 1 | users |\n",
+    );
+    write(
+        repo,
+        "db/migration/V2__users.sql",
+        "ALTER TABLE users ADD x int;\n",
+    );
+    git(repo, &["add", "-A"]);
+    let tree = String::from_utf8(git_out(repo, &["write-tree"]).stdout).unwrap();
+    git(repo, &["reset", "-q"]);
+    let text = markdown(repo, &format!("HEAD..{}", tree.trim()));
+    assert!(
+        text.starts_with(&format!(
+            "diffctx impact for the snapshot tree {}",
+            &tree[..10]
+        )),
+        "{text}"
+    );
+    let doc = impact(repo, &format!("HEAD..{}", tree.trim()));
+    let contracts = doc["contracts"].to_string();
+    assert!(contracts.contains("V2__users.sql"), "{doc}");
+    assert!(!contracts.contains("PLAN.md"), "{doc}");
+}

@@ -643,6 +643,9 @@ fn statements(command: &str) -> Vec<Statement> {
                 found.push(Statement {
                     verb: if prog == "gh" {
                         format!("gh {verb}")
+                    } else if verb == "grep" {
+                        // Its positionals are revisions, not paths (#486).
+                        "git grep".to_string()
                     } else {
                         verb
                     },
@@ -667,11 +670,16 @@ const SEARCH_VALUE_FLAGS: &str = "-f --file -A -B -C --context --after-context -
 
 /// The pattern of a grep/rg/ag/`git grep` argument list, and the path after
 /// it when there is one.
-fn search_pattern(args: &[String]) -> Option<(String, Option<String>)> {
+/// `git grep PATTERN [REV…] [-- PATH…]` names its paths only after `--`;
+/// a word between the pattern and `--` is a revision (`origin/main`).
+fn search_pattern(args: &[String], git: bool) -> Option<(String, Option<String>)> {
     let mut pattern = None;
+    let mut paths_follow = !git;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "-e" || a == "--regexp" {
+        if git && a == "--" {
+            paths_follow = true;
+        } else if a == "-e" || a == "--regexp" {
             pattern = it.next().cloned();
         } else if let Some(p) = a.strip_prefix("--regexp=") {
             pattern = Some(p.to_string());
@@ -681,7 +689,7 @@ fn search_pattern(args: &[String]) -> Option<(String, Option<String>)> {
             // A boolean flag, or `--` before the paths.
         } else if pattern.is_none() {
             pattern = Some(a.clone());
-        } else {
+        } else if paths_follow {
             let path = Some(expand_home(a)).filter(|p| !is_unresolvable(p));
             return Some((pattern?, path));
         }
@@ -694,28 +702,45 @@ fn search_pattern(args: &[String]) -> Option<(String, Option<String>)> {
 const DECLARATION_WORDS: &str = "def class fn func function struct enum trait impl interface type let const var pub async static export import from new self this return";
 
 /// The identifiers a search pattern names, with its regex escapes (`\b`,
-/// `\(`, `\w`) and declaration keywords dropped.
+/// `\(`, `\w`) and declaration keywords dropped: one per alternation branch
+/// that names exactly one, read off the end of its qualified chain —
+/// `tests.direct`, `tests\.direct` and `a::direct` search for `direct`, not
+/// for `tests` (#402). A test module or test function is no definition a
+/// caller list answers for.
 fn pattern_names(pattern: &str) -> Vec<String> {
-    let mut cleaned = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            chars.next();
-            cleaned.push(' ');
-        } else if c.is_alphanumeric() || c == '_' {
-            cleaned.push(c);
-        } else {
-            cleaned.push(' ');
-        }
-    }
     let mut names: Vec<String> = Vec::new();
-    for w in cleaned.split_whitespace() {
-        if w.chars().count() >= 2
-            && !w.starts_with(|c: char| c.is_ascii_digit())
-            && !DECLARATION_WORDS.split(' ').any(|d| d == w)
-            && !names.iter().any(|n| n == w)
-        {
-            names.push(w.to_string());
+    for branch in pattern.split("\\|").flat_map(|b| b.split('|')) {
+        let joined = branch.replace("\\.", ".").replace("::", ".");
+        let mut cleaned = String::with_capacity(joined.len());
+        let mut chars = joined.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                chars.next();
+                cleaned.push(' ');
+            } else if c.is_alphanumeric() || c == '_' || c == '.' {
+                cleaned.push(c);
+            } else {
+                cleaned.push(' ');
+            }
+        }
+        let branch_names: Vec<&str> = cleaned
+            .split_whitespace()
+            .filter_map(|chain| chain.split('.').filter(|s| !s.is_empty()).next_back())
+            .filter(|w| {
+                w.chars().count() >= 2
+                    && !w.starts_with(|c: char| c.is_ascii_digit())
+                    && !DECLARATION_WORDS.split(' ').any(|d| d == *w)
+            })
+            .collect();
+        // A branch that names several identifiers is a line of code, not a
+        // search for one of them (`for (path, line, text) in hits`).
+        if let [w] = branch_names[..] {
+            if !matches!(w, "test" | "tests")
+                && !w.starts_with("test_")
+                && !names.iter().any(|n| n == w)
+            {
+                names.push(w.to_string());
+            }
         }
     }
     names.truncate(8);
@@ -1947,7 +1972,7 @@ fn lead_of(event: Event, trigger: &Trigger) -> String {
         }
         (Event::PostToolUse, Trigger::Inspect { own: Some(own), .. }) if own.others > 0 => {
             return format!(
-                "diffctx reviewed the pending change this session made, which you just inspected; {} other changed file(s) were not edited in this session and are not analysed.",
+                "diffctx reviewed the pending change this session and its subagents made, which you just inspected; {} other changed file(s) were not edited in this session or by its subagents and are not analysed.",
                 own.others
             );
         }
@@ -1967,11 +1992,18 @@ fn impact_context(
         return Err("empty");
     }
     let partial = !output.limits.is_empty();
+    // With no caller listed, what is left to check is a contract or an
+    // untested definition, not a caller (#463).
+    let check = if output.changed.iter().any(|c| !c.callers.is_empty()) {
+        "Check these callers"
+    } else {
+        "Check these"
+    };
     let text = crate::impact::render_automatic(&mut output, AUTOMATIC_TOKEN_CAP);
     let headline = text.lines().next().unwrap_or_default().to_string();
     Ok(Answer {
         context: format!(
-            "{} What it reaches outside the diff:\n{text}\nCheck these callers before going on, or tell the user why they are unaffected.",
+            "{} What it reaches outside the diff:\n{text}\n{check} before going on, or tell the user why they are unaffected.",
             lead_of(event, trigger)
         ),
         headline,
@@ -1994,10 +2026,12 @@ fn searched(payload: &serde_json::Value) -> Option<Searched> {
         });
     }
     let command = payload["tool_input"]["command"].as_str()?;
-    let Statement { dir, args, .. } = statements(command)
+    let Statement {
+        dir, args, verb, ..
+    } = statements(command)
         .into_iter()
-        .find(|st| st.verb == "grep" && !st.lost)?;
-    let (pattern, path) = search_pattern(&args)?;
+        .find(|st| (st.verb == "grep" || st.verb == "git grep") && !st.lost)?;
+    let (pattern, path) = search_pattern(&args, verb == "git grep")?;
     Some(Searched {
         dir: path.map(|p| join_dir(dir.as_deref(), &p)).or(dir),
         pattern,

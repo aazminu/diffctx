@@ -248,8 +248,10 @@ def _call_with_wall_clock_deadline(build: Callable[[], _T], timeout_seconds: int
     grace = _WATCHDOG_GRACE_SECONDS
     wait = timeout_seconds + grace
     override = os.environ.get("DIFFCTX_TEST_WATCHDOG_GRACE_SECS")
-    if override is not None and override.isdigit():
-        grace = wait = int(override)
+    # ASCII digits within u64, as the binary reads it: "²" and "+5" are no
+    # override, and a wait past threading.TIMEOUT_MAX is clamped, not raised.
+    if override and override.isascii() and override.isdigit() and int(override) < 2**64:
+        grace = wait = min(int(override), int(threading.TIMEOUT_MAX))
     thread = threading.Thread(target=worker, name="diffctx-pipeline", daemon=True)
     thread.start()
     thread.join(wait)

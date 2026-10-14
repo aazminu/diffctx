@@ -55,7 +55,6 @@ static GENERATED_PATH_SEGMENTS: Lazy<FxHashSet<&'static str>> = Lazy::new(|| {
 
 const GENERATED_CONTENT_MARKERS: &[&str] = &[
     "@generated",
-    "do not edit",
     "code generated",
     "auto-generated",
     "this file is generated",
@@ -108,6 +107,12 @@ fn has_generated_content_marker(content: &str) -> bool {
         .collect::<Vec<_>>()
         .join("\n")
         .to_lowercase();
+    // "Do not edit" is a generator's warning only beside the word that says
+    // a generator wrote it; a hand-written "do not edit without approval"
+    // marks a file people do edit (#411).
+    if header.contains("do not edit") && header.contains("generat") {
+        return true;
+    }
     for marker in GENERATED_CONTENT_MARKERS {
         if !header.contains(marker) {
             continue;

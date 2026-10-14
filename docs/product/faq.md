@@ -79,7 +79,8 @@ level with full gitignore semantics, plus secret-like paths (`id_rsa`,
 `*.pem`, `*.key`, ...) even without an entry. An excluded path appears in no
 role: in diff mode it leaves both the changed files and the candidate
 universe, so it cannot come back as context (also under `--full`). Impact
-does not yet count changed files withheld this way in its header (#392).
+counts the changed files withheld this way in its header and names none of
+them.
 `-w`/`.diffctx/whitelist`, `-i` and `--no-default-ignores`/`--no-ignores`
 are tree-mode only and refused with `--diff` and `graph`.
 
