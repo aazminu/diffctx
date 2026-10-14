@@ -236,25 +236,25 @@ wheels = [
 
 [[package]]
 name = "diffctx"
-version = "1.19.0"
+version = "1.19.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pathspec" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1f/97/a24423fff82b84f34f4db64756f73c89097fb4b4f6242c12c68341dd3d4e/diffctx-1.19.0.tar.gz", hash = "sha256:0b13b0d8ba5f4b105b4ac2c0c5c91cf9748bb0293f46f6aa2a40da946d13a772", size = 659201, upload-time = "2026-10-14T05:22:49.163Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ba/df/503a026b63b548d2285e284f0369e6bdb87ddb2a0abf30359134d6b5c329/diffctx-1.19.1.tar.gz", hash = "sha256:025aae2efe356a5f5f902d2987edd61c930676102b47be5bd77460b68cf59ef3", size = 674596, upload-time = "2026-10-14T19:05:34.176Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3a/0a/368f3b965647c2a33aba207239ea31355a1021918dd348d3eb5cc466f311/diffctx-1.19.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:b1f372dc190175a5f69b85d20c6e5b488ac24c74eb51076c03ff19779e3f907b", size = 10637581, upload-time = "2026-10-14T05:22:21.957Z" },
-    { url = "https://files.pythonhosted.org/packages/19/8f/4a3b454e4f429b365da23f03045a8af6bb9e5e2a49d48d8b7414b543e7b7/diffctx-1.19.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:90928be576df5a044a7448804af6ca39fe49aaa4108385ac0769dd24d94156c8", size = 10788371, upload-time = "2026-10-14T05:22:24.273Z" },
-    { url = "https://files.pythonhosted.org/packages/53/23/3ed3beee978fffbe28485b7d5d65d22ff6ed0fdffabfb1a958790be081a6/diffctx-1.19.0-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:a3da6259a941804ec1ed8ad288e6668d104406dde704cd9914310c3a2a7de1c6", size = 10456669, upload-time = "2026-10-14T05:22:26.455Z" },
-    { url = "https://files.pythonhosted.org/packages/67/02/936879679fd3de61d2ec2b16342f4bbb4ab8f4c87a3e63d42b868bf9328d/diffctx-1.19.0-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:351842fa6d54e85c58f870733b48e16babb2c0f663f3e21bf5dda37f0cbd4275", size = 10787500, upload-time = "2026-10-14T05:22:28.745Z" },
-    { url = "https://files.pythonhosted.org/packages/0a/a8/db9628a0ce0c078256463a994a6674f624175d9268bd7d974f7c1620f33a/diffctx-1.19.0-cp310-abi3-win_amd64.whl", hash = "sha256:4b5759bd1ccf4c6d9e8345b101ead1eab5f44e040935a6a29d252d356c8141e2", size = 10797701, upload-time = "2026-10-14T05:22:31.084Z" },
-    { url = "https://files.pythonhosted.org/packages/f8/0b/e6a0bb196d2227aea126d546382c9af155aba8c34f54079c1ffe9525c830/diffctx-1.19.0-cp310-abi3-win_arm64.whl", hash = "sha256:07bb3b3fc9858cab6fc3af7d7d42af44fe5a5e8657274007f517252d6ed7b6e1", size = 10423641, upload-time = "2026-10-14T05:22:33.282Z" },
-    { url = "https://files.pythonhosted.org/packages/94/46/e585453f38c48ec68d73c657fc59cb90034bd698b7fdefa2ff3e7c12555b/diffctx-1.19.0-cp314-cp314t-macosx_10_12_x86_64.whl", hash = "sha256:f40b3e64fbc8cc04bc83971bdcd4f41bd02008ebe5fdaf8681820ba0e8a184f8", size = 10638791, upload-time = "2026-10-14T05:22:35.333Z" },
-    { url = "https://files.pythonhosted.org/packages/b1/7c/d5c254bf66984d2142e8be68d4c093281a00b7ef3fef3c44def97399e9a6/diffctx-1.19.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:91b0fa64ce00b4454094ee7a6bcf633cd5d00827f811c8f63a86f32015e86bb4", size = 10778849, upload-time = "2026-10-14T05:22:38.024Z" },
-    { url = "https://files.pythonhosted.org/packages/13/c1/5a6698c25ac57a95683ffc092112bf6e97f364b1a5a53a0bdb337a51ebb0/diffctx-1.19.0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:919e05c45169b2e5220f0bc88f1c19675330bebc7f6da7b0af2a62597092b0ef", size = 10444832, upload-time = "2026-10-14T05:22:40.692Z" },
-    { url = "https://files.pythonhosted.org/packages/a7/2b/a34d3a715b1b5e85fe2a36b2086e351100bb139adff11db2ba06aa3cc48f/diffctx-1.19.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:c6053ba5ac5cd5368dcf5aedd49e6726a03b4511cff4865c162722e125efad2b", size = 10780127, upload-time = "2026-10-14T05:22:42.77Z" },
-    { url = "https://files.pythonhosted.org/packages/20/c1/27e0cf3a1d695afd54de38c9270a10981ea0157d1e7055cb9544876afeb2/diffctx-1.19.0-cp314-cp314t-win_amd64.whl", hash = "sha256:82a2400706283db3887e7f6d6303bce1bcb868770e68dcbf49e2ecc04b85bcfa", size = 10781211, upload-time = "2026-10-14T05:22:44.863Z" },
-    { url = "https://files.pythonhosted.org/packages/29/cf/1c202e2349903454dc2bb09b67fc6467ca27c5dde7679f4ab6bf0c92781d/diffctx-1.19.0-cp314-cp314t-win_arm64.whl", hash = "sha256:c8ad6ec772685a3502b9bac36cb4441d4dc062587d9784a66fabd3c6c20bcdfe", size = 10423322, upload-time = "2026-10-14T05:22:46.982Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/79/be148d0754a4dcd185f2f719ffed70cfb5e31f04b31becf313a1b46d8de7/diffctx-1.19.1-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:d40465ba7c11038cd97e3019a5c02b350683f4c654a0f5fc89ed477c08d85bb7", size = 10703675, upload-time = "2026-10-14T19:05:07.57Z" },
+    { url = "https://files.pythonhosted.org/packages/54/05/7c606f458031bab4e68e02687d20e120b839fe58aca2634edb3adb333e76/diffctx-1.19.1-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:8ae913710ed70187d3c53ea057d98845bf781c855e4af11f1ad6e1f2acc47c9b", size = 10844140, upload-time = "2026-10-14T19:05:10.779Z" },
+    { url = "https://files.pythonhosted.org/packages/14/a6/dff32bc43e2ee836c100c59125472d5fd1b45d17338515aeec42496ef344/diffctx-1.19.1-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:d2b09b0017a6649b97d36c2241e2eb8211c901653cdff5806b02a0f96a476e0f", size = 10512182, upload-time = "2026-10-14T19:05:13.077Z" },
+    { url = "https://files.pythonhosted.org/packages/83/2c/2170c96272dfe4fa7b6157afe8ef98b6785353ae130a0c0b645b02745020/diffctx-1.19.1-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:87abe0923961fec1dd34a27ab42975e443f70eaa686c905ddf95aecec8de9221", size = 10841400, upload-time = "2026-10-14T19:05:15.262Z" },
+    { url = "https://files.pythonhosted.org/packages/85/0a/45971df5d3050c54f672da1b450dfb21d4579c70bf78470c0e58fc9bc453/diffctx-1.19.1-cp310-abi3-win_amd64.whl", hash = "sha256:24aa72eb5e4a6333ca278a32f95daa16a8a18bc16875365faea69c6130f8dc7e", size = 10866180, upload-time = "2026-10-14T19:05:17.37Z" },
+    { url = "https://files.pythonhosted.org/packages/66/c0/823a1447ee35e318d69cc27cf54a1afa935fae8832ce1b8e9e170490a921/diffctx-1.19.1-cp310-abi3-win_arm64.whl", hash = "sha256:4ec2fd797f8c39da9e001a92c2bd4fd7ca1e902ddffd2c2849650f8ec3c70fd5", size = 10488800, upload-time = "2026-10-14T19:05:19.57Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/e9/111cab02d28da4eaee4ce613bdfc627a83fa8610ce20d7317cc87b5c9b4a/diffctx-1.19.1-cp314-cp314t-macosx_10_12_x86_64.whl", hash = "sha256:766e83405ff3738377c0cf37eb6436d6fe90e8fed5eef5cd85d004dbe30a88e8", size = 10702028, upload-time = "2026-10-14T19:05:21.628Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/2e/0035e60104bf9a7519182c42b59c5f0b659118c23a572b3a1281169e24ff/diffctx-1.19.1-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:4ae494fa8b7d62be7ff902086384afc6700b01317177404fef29d78849d9af54", size = 10838794, upload-time = "2026-10-14T19:05:23.848Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/37/ce55df7187f9cdc406f47e7ecfbfdd96f4b5301a721344b79f4be2f76813/diffctx-1.19.1-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:49426a6ba719d7caf9cbdf3393e093a406ba91ebe47f2e36aa2484d70b0d3043", size = 10508401, upload-time = "2026-10-14T19:05:25.801Z" },
+    { url = "https://files.pythonhosted.org/packages/44/a8/e362183f7c3a3a189363d72f4d113d88f868c5d3447804ce45b36f147478/diffctx-1.19.1-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:33c5a2865849dc07fba98dc004e996b9127cc8cefa167d66b3c769cf32adc5a8", size = 10833558, upload-time = "2026-10-14T19:05:27.874Z" },
+    { url = "https://files.pythonhosted.org/packages/83/df/6e491368460c8924c912596adad89476214939d6f3e2094df23a099b863d/diffctx-1.19.1-cp314-cp314t-win_amd64.whl", hash = "sha256:28b8f6c85d5b392bc99dc6bbc9816cd22d5976de58e79c8a6f1356786d207e93", size = 10853781, upload-time = "2026-10-14T19:05:29.966Z" },
+    { url = "https://files.pythonhosted.org/packages/58/78/fa550f2e85d1fe1edd75c4164603043a5357eddebc85b2f3a08bae57627f/diffctx-1.19.1-cp314-cp314t-win_arm64.whl", hash = "sha256:747436060e67fc86c7577233bcc3c193b38bb21e287c2e11141c037399761903", size = 10486407, upload-time = "2026-10-14T19:05:31.987Z" },
 ]
 
 [package.optional-dependencies]
@@ -272,7 +272,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "diffctx", extras = ["mcp"], specifier = "==1.19.0" }]
+requires-dist = [{ name = "diffctx", extras = ["mcp"], specifier = "==1.19.1" }]
 
 [[package]]
 name = "exceptiongroup"
