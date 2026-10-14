@@ -46,6 +46,10 @@ pub struct ScoredState {
     pub scoring_result: ScoringResult,
     pub needs: Vec<InformationNeed>,
     pub changed_files: Vec<PathBuf>,
+    /// The `changed_files` git does not track yet: new work in a working
+    /// tree, named apart so a count of changed files is what git would
+    /// commit (#418).
+    pub untracked_files: Vec<PathBuf>,
     pub deleted_files: Vec<String>,
     pub renamed_files: Vec<(String, String)>,
     /// Lock files touched by the range, paths only: the dependency bump is
@@ -347,6 +351,7 @@ struct ChangeSetData {
     hunks: Vec<crate::types::DiffHunk>,
     diff_text: String,
     changed_files: Vec<PathBuf>,
+    untracked_files: Vec<PathBuf>,
     deleted_display: Vec<String>,
     renamed_display: Vec<(String, String)>,
     lockfile_display: Vec<String>,
@@ -371,6 +376,7 @@ enum ChangeSet {
     /// reader sees an unrepresented change rather than "no change".
     Empty {
         changed_files: Vec<PathBuf>,
+        untracked_files: Vec<PathBuf>,
         lockfile_changes: Vec<String>,
         ignored_changes: Vec<String>,
         policy_excluded_count: usize,
@@ -385,7 +391,7 @@ enum ChangeSet {
 /// Shared with `--full`. It used to call `parse_diff` alone, which made
 /// `diffctx . --full` blind to every new file in the tree while the default
 /// mode saw them: the escape hatch that promises MORE context returned less.
-fn collect_hunks_with_untracked(
+pub(crate) fn collect_hunks_with_untracked(
     root_dir: &Path,
     diff_range: Option<&str>,
     pathspec: &[String],
@@ -403,21 +409,27 @@ fn collect_hunks_with_untracked(
     // root and would otherwise be line-counted and then fragmented out of the
     // file it points at.
     untracked_files.retain(|f| crate::paths::resolve_within(root_dir, f).is_some());
-    for f in &untracked_files {
-        if let Some(line_count) = count_text_lines(f) {
-            if line_count > 0 {
-                let path_str: Arc<str> = Arc::from(f.to_string_lossy().as_ref());
-                hunks.push(crate::types::DiffHunk {
-                    path: path_str,
-                    new_start: 1,
-                    new_len: line_count,
-                    old_start: 0,
-                    old_len: 0,
-                });
-            }
+    // An untracked binary — a local database, a build artefact — is no
+    // source change: counted, it inflated every "N changed file(s)" with
+    // files nobody meant to commit and diffctx cannot read (#423).
+    let mut text_files = Vec::with_capacity(untracked_files.len());
+    for f in untracked_files {
+        let Some(line_count) = count_text_lines(&f) else {
+            continue;
+        };
+        if line_count > 0 {
+            let path_str: Arc<str> = Arc::from(f.to_string_lossy().as_ref());
+            hunks.push(crate::types::DiffHunk {
+                path: path_str,
+                new_start: 1,
+                new_len: line_count,
+                old_start: 0,
+                old_len: 0,
+            });
         }
+        text_files.push(f);
     }
-    Ok((hunks, untracked_files))
+    Ok((hunks, text_files))
 }
 
 /// A listing of what the change touches. The run's own deadline or
@@ -500,6 +512,26 @@ fn ignore_disclosure(
 /// a mode flip, a submodule pointer, a `-diff` attribute — minus everything
 /// the run withholds. Listed so the artifact says "changed, unrepresented"
 /// where it used to say nothing.
+/// What the range's head no longer holds: a deleted path and a rename's
+/// old name. Their bodies exist only at the base, so none of them is the
+/// change's content; `--full` once showed a deleted file's old body as
+/// changed (#409).
+fn gone_at_head(
+    root_dir: &Path,
+    diff_range: Option<&str>,
+    pathspec: &[String],
+    run: Option<&crate::resource::RunContext>,
+) -> Result<FxHashSet<PathBuf>> {
+    let deleted = unless_cut_short(run, git::get_deleted_files(root_dir, diff_range, pathspec))?;
+    let renamed_old =
+        unless_cut_short(run, git::get_renamed_paths(root_dir, diff_range, pathspec))?;
+    Ok(deleted.into_iter().chain(renamed_old).collect())
+}
+
+fn is_gone(gone: &FxHashSet<PathBuf>, file: &Path) -> bool {
+    gone.contains(&dunce::canonicalize(file).unwrap_or_else(|_| file.to_path_buf()))
+}
+
 fn hunkless_changed_files(
     root_dir: &Path,
     diff_range: Option<&str>,
@@ -513,18 +545,14 @@ fn hunkless_changed_files(
     if changed.is_empty() {
         return Ok(changed);
     }
-    let deleted = unless_cut_short(run, git::get_deleted_files(root_dir, diff_range, pathspec))?;
-    let renamed_old =
-        unless_cut_short(run, git::get_renamed_paths(root_dir, diff_range, pathspec))?;
-    let excluded: FxHashSet<PathBuf> = deleted.into_iter().chain(renamed_old).collect();
+    let excluded = gone_at_head(root_dir, diff_range, pathspec, run)?;
     let rel_paths: Vec<String> = changed
         .iter()
         .filter_map(|p| rel_path_string(root_dir, p))
         .collect();
     let ignored = git::find_ignored_paths_with_source(root_dir, &rel_paths);
     changed.retain(|f| {
-        let resolved = dunce::canonicalize(f).unwrap_or_else(|_| f.clone());
-        !excluded.contains(&resolved) && !is_lockfile_path(f) && !is_withheld(root_dir, f, &ignored)
+        !is_gone(&excluded, f) && !is_lockfile_path(f) && !is_withheld(root_dir, f, &ignored)
     });
     changed.sort();
     changed.dedup();
@@ -555,9 +583,10 @@ fn resolve_change_set(
                 root_dir,
                 diff_range,
                 pathspec,
-                untracked_files,
+                untracked_files.clone(),
                 Some(run),
             )?,
+            untracked_files,
             lockfile_changes: Vec::new(),
             ignored_changes: Vec::new(),
             policy_excluded_count: secret_excluded_paths.len(),
@@ -590,9 +619,10 @@ fn resolve_change_set(
                 root_dir,
                 diff_range,
                 pathspec,
-                untracked_files,
+                untracked_files.clone(),
                 Some(run),
             )?,
+            untracked_files,
             lockfile_changes: lockfile_display,
             ignored_changes: ignored_display,
             policy_excluded_count: policy_excluded,
@@ -602,32 +632,29 @@ fn resolve_change_set(
     let diff_text = git::get_diff_text(root_dir, diff_range, pathspec)?;
 
     let mut changed_files = git::get_changed_files(root_dir, diff_range, pathspec)?;
-    changed_files.extend(untracked_files);
+    changed_files.extend(untracked_files.iter().cloned());
     if changed_files.is_empty() {
         return Ok(ChangeSet::Empty {
             changed_files: Vec::new(),
+            untracked_files: Vec::new(),
             lockfile_changes: lockfile_display,
             ignored_changes: ignored_display,
             policy_excluded_count: policy_excluded,
         });
     }
 
-    let deleted_files = git::get_deleted_files(root_dir, diff_range, pathspec)?;
-    // Rename source paths are gone from disk and cannot be fragmented; the
-    // destinations exist on HEAD and stay candidates via the changed set below,
-    // so seeds and discovery still find them.
-    let renamed_old = git::get_renamed_paths(root_dir, diff_range, pathspec)?;
+    // Rename destinations exist on the head and stay candidates via the
+    // changed set below, so seeds and discovery still find them.
+    let excluded = gone_at_head(root_dir, diff_range, pathspec, None)?;
     // Display lists for the output header: deletions and renames produce no
     // fragments, but silently omitting them misrepresents the diff (a
     // deletion-only commit used to render as a bare two-line skeleton).
     let (deleted_display, renamed_display) =
         deletion_rename_displays(root_dir, diff_range, pathspec, Some(run))?;
-    let excluded: FxHashSet<PathBuf> = deleted_files.into_iter().chain(renamed_old).collect();
     let changed_files: Vec<PathBuf> = changed_files
         .into_iter()
         .filter(|f| {
-            let resolved = dunce::canonicalize(f).unwrap_or_else(|_| f.clone());
-            !excluded.contains(&resolved)
+            !is_gone(&excluded, f)
                 && !is_lockfile_path(f)
                 && !is_withheld(root_dir, f, &ignored_rel_paths)
         })
@@ -685,6 +712,7 @@ fn resolve_change_set(
         hunks,
         diff_text,
         changed_files,
+        untracked_files,
         deleted_display,
         renamed_display,
         lockfile_display,
@@ -841,21 +869,17 @@ fn resolve_symbol_change_set(
         ))],
         None => scope.to_vec(),
     };
-    let mut files = git::grep_files_with_word(root_dir, name, &pathspec)?;
-    let rel: Vec<String> = files
-        .iter()
-        .filter_map(|f| rel_path_string(root_dir, f))
-        .collect();
-    let withheld: FxHashSet<String> = withheld_paths(root_dir, &rel).into_iter().collect();
-    files.retain(|f| {
-        !is_lockfile_path(f) && rel_path_string(root_dir, f).is_some_and(|r| !withheld.contains(&r))
-    });
+    let named = git::grep_files_with_word(root_dir, name, &pathspec)?;
+    let withheld = named.withheld;
+    let mut files = named.rows;
+    files.retain(|f| !is_lockfile_path(f));
     let named_in = files.len();
     if files.len() > MAX_SYMBOL_FILES {
         // The files that spell a declaration of the name go first, so the
         // cap drops callers, never the definition the answer starts from.
         let declaring: FxHashSet<PathBuf> =
             git::grep_files_with_declaration(root_dir, name, &pathspec)
+                .map(|g| g.rows)
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
@@ -989,6 +1013,7 @@ fn resolve_symbol_change_set(
         hunks,
         diff_text,
         changed_files,
+        untracked_files: Vec::new(),
         deleted_display: Vec::new(),
         renamed_display: Vec::new(),
         lockfile_display: Vec::new(),
@@ -1150,6 +1175,7 @@ pub fn compute_scored_state_anchored(
     let data = match change_set {
         ChangeSet::Empty {
             changed_files,
+            untracked_files,
             lockfile_changes,
             ignored_changes,
             policy_excluded_count,
@@ -1158,6 +1184,7 @@ pub fn compute_scored_state_anchored(
                 empty_scored_state_with_changes(root_dir, diff_range, &scope, timeout, run)?;
             state.change_classes = classify_changes(&state.root_dir, &changed_files, &[], &[], &[]);
             state.changed_files = changed_files;
+            state.untracked_files = untracked_files;
             state.lockfile_changes = lockfile_changes;
             state.ignored_changes = ignored_changes;
             state.policy_excluded_count = policy_excluded_count;
@@ -1173,6 +1200,7 @@ pub fn compute_scored_state_anchored(
         hunks,
         diff_text,
         changed_files,
+        untracked_files,
         deleted_display,
         renamed_display,
         lockfile_display,
@@ -1386,6 +1414,7 @@ pub fn compute_scored_state_anchored(
         needs,
         discovery_source,
         changed_files,
+        untracked_files,
         deleted_files: deleted_display,
         renamed_files: renamed_display,
         lockfile_changes: lockfile_display,
@@ -2524,7 +2553,8 @@ fn build_diff_context_full(
     }
     let mut changed_files = git::get_changed_files(&root_dir, diff_range, &scope)?;
     changed_files.extend(untracked_files);
-    changed_files.retain(|f| !is_withheld(&root_dir, f, &ignored_rel_paths));
+    let gone = gone_at_head(&root_dir, diff_range, &scope, None)?;
+    changed_files.retain(|f| !is_gone(&gone, f) && !is_withheld(&root_dir, f, &ignored_rel_paths));
     changed_files.dedup();
     if changed_files.is_empty() {
         return full_empty_output(&root_dir, diff_range, &scope, &[], &withheld);
@@ -2681,6 +2711,7 @@ fn empty_scored_state(
         },
         needs: Vec::new(),
         changed_files: Vec::new(),
+        untracked_files: Vec::new(),
         deleted_files: Vec::new(),
         renamed_files: Vec::new(),
         preferred_revs: Vec::new(),

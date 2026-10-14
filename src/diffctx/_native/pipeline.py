@@ -102,6 +102,7 @@ def build_impact(
     paths: list[str] | None = None,
     markdown: bool = False,
     symbol: str | None = None,
+    budget: int | None = None,
 ) -> str:
     from diffctx._diffctx import build_impact as _rust_impact
 
@@ -115,6 +116,7 @@ def build_impact(
             paths=paths or [],
             markdown=markdown,
             symbol=symbol,
+            budget=budget,
         )
     )
 

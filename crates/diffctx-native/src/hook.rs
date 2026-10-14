@@ -1,19 +1,24 @@
 //! `diffctx hook <event>`: the Claude Code hooks that put a change's impact
 //! in front of the agent without asking it to call anything (#310).
 //!
-//! * `pretooluse`: before `git commit`, `merge`, `cherry-pick`, `push` or
-//!   `gh pr create`, the impact of what that command is about to record.
-//! * `posttooluse`: after a `git diff` or `git status` the agent ran on its
-//!   own, the impact of the working tree it just asked about — the path the
-//!   agent already walks, with nothing new to decide. After a text search
-//!   for a name the pending change edits, that name's callers.
+//! * `pretooluse`: before a line that commits, merges, picks, reverts or
+//!   pushes, the refs of each repository it names, and nothing else; before
+//!   `gh pr create`, the impact of the commits the PR proposes.
+//! * `posttooluse`: once that line ran, the impact of what git recorded —
+//!   read off the reflog, never predicted from the command text (#508).
+//!   After a `git diff` or `git status` the agent ran on its own, the impact
+//!   of the working tree it just asked about. After a text search for a name
+//!   the pending change edits, that name's callers.
 //!
-//! Each reads the event on stdin and answers with `additionalContext`, or
-//! with nothing when the impact is empty, the same content was already
-//! reviewed, or anything at all goes wrong. A hook that blocks a commit
-//! because it failed would be worse than no hook; the one deliberate block,
-//! the opt-in strict gate, denies with the impact attached so the retry
-//! passes.
+//! Each reads the event on stdin and answers with `additionalContext`: the
+//! impact, a pointer when what landed was already shown, or one line when it
+//! reaches nothing or the line could not be read (#464, #501); nothing when
+//! the line recorded nothing or anything at all goes wrong. A hook that
+//! blocks a commit because it failed would be worse than no hook; the one
+//! deliberate block, the opt-in strict gate, reviews the index a plain
+//! `git commit` records before it runs and denies once with the impact
+//! attached, so the retry passes. A commit line that stages for itself is
+//! asked to stage first instead.
 
 use std::io::Write as _;
 
@@ -61,26 +66,17 @@ impl Event {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Trigger {
-    Commit {
-        /// `--amend` rewrites `HEAD`: what lands is measured against `HEAD~1`.
-        amend: bool,
-        staging: Staging,
-        /// The `git add` / `git rm` statements earlier on the line, which have
-        /// not run when the hook does: replayed on a copy of the index.
-        steps: Vec<Replay>,
-    },
-    /// After `git commit`: what the line landed on `onto` — the `HEAD` its
-    /// `PreToolUse` recorded, or that commit's parent for an amend — reviewed
-    /// when it is not what the preview before it showed. `onto` is read off
-    /// the record once the repository is known (#406).
-    Committed {
-        amend: bool,
-        onto: Option<String>,
-    },
-    Merge(String),
-    /// Every commit the line picks, in order; a range stays one entry.
-    CherryPick(Vec<String>),
-    Push(Pushed),
+    /// `git commit` under the strict gate, the one event reviewed before git
+    /// runs: the index it will record. `plain` is a line that stages nothing
+    /// itself and names no paths and no `-a`; anything else is asked to
+    /// stage first, so the gate never predicts what a command will stage.
+    Commit { amend: bool, plain: bool },
+    /// What a commit, merge, cherry-pick, revert or push recorded, read off
+    /// git's own reflog once the line ran. Predicting it from the command
+    /// text took fifteen parser commits in nine days and still reviewed another
+    /// session's staged file for `--pathspec-from-file` (#508). `also`
+    /// counts the other refs one push moved, which are not reviewed.
+    Landed { verb: &'static str, also: usize },
     /// `gh pr create`: `head` (the current branch unless `--head` names
     /// one) against `base` (the remote's default unless `--base` names one).
     PullRequest {
@@ -91,10 +87,7 @@ pub enum Trigger {
     /// (`--cached`/`--staged` narrows it to the index). `own` is what this
     /// session's transcript shows it edited, read once the repository is
     /// known; `None` when no transcript could tell (#404).
-    Inspect {
-        staged: bool,
-        own: Option<Owned>,
-    },
+    Inspect { staged: bool, own: Option<Owned> },
 }
 
 /// The changed files an inspecting session edited itself, in a checkout
@@ -104,54 +97,6 @@ pub struct Owned {
     pub files: Vec<String>,
     /// Changed files no edit of this session touched: counted, not reviewed.
     pub others: usize,
-}
-
-/// What `git commit` takes from the index at the moment it starts.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Staging {
-    /// A plain commit: the index, with the line's own staging applied.
-    Index,
-    /// `-a`: every tracked change on top (`git add -u`).
-    All,
-    /// A pathspec: those paths as they stand, on top of `HEAD` (`--only`).
-    Only(Vec<String>),
-    /// `-i <paths>`: those paths on top of the index.
-    Include(Vec<String>),
-    /// A line the index cannot be planned for (`git mv`, an interactive
-    /// add): the working tree, as an estimate.
-    Worktree,
-}
-
-/// The one ref a `git push` sends, as its line names it (#416).
-#[derive(Debug, PartialEq, Eq)]
-pub enum Pushed {
-    /// `git push` alone: the current branch, onto its upstream.
-    Upstream,
-    /// `<src>[:<dst>]` onto `remote`; without `dst`, `src`'s own branch.
-    Ref {
-        remote: String,
-        src: String,
-        dst: Option<String>,
-    },
-    /// A variable, a glob, several refs, `--all`: logged as unresolved,
-    /// never stood in for by the current branch.
-    Unresolved,
-}
-
-/// A staging statement as the line spells it, and the directory it runs in.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Replay {
-    pub dir: Option<String>,
-    pub args: Vec<String>,
-}
-
-impl Trigger {
-    /// Built before git runs from what the line will stage, not read off
-    /// the index as it stands.
-    fn is_preview(&self) -> bool {
-        matches!(self, Self::Commit { staging, steps, .. }
-            if *staging != Staging::Index || !steps.is_empty())
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -185,6 +130,13 @@ fn words(command: &str) -> Vec<String> {
                 }
                 skip_substitution(&mut chars, &mut cur);
             }
+            // Inside `"…"` a backslash escapes `"`, `\`, `$` and a backtick
+            // and joins lines; before anything else it is itself (#436).
+            Some('"') if c == '\\' => match chars.next_if(|n| "\"\\$`\n".contains(*n)) {
+                Some('\n') => {}
+                Some(n) => cur.push(n),
+                None => cur.push(c),
+            },
             Some(q) => {
                 if c == q {
                     quote = None;
@@ -521,25 +473,6 @@ fn short_flags(args: &[String]) -> String {
     flags
 }
 
-/// Value flags of `merge` / `cherry-pick` beyond the shared ones: the `1`
-/// of `cherry-pick -m 1 X` is a parent number, not a commit.
-const MERGE_VALUE_FLAGS: &[&str] = &["-s", "-X", "--strategy", "--strategy-option", "--mainline"];
-
-fn positionals_skipping(args: &[String], extra: &[&str]) -> Vec<String> {
-    let kept: Vec<String> = args
-        .iter()
-        .scan(false, |skip, a| {
-            if std::mem::take(skip) {
-                return Some(None);
-            }
-            *skip = extra.contains(&a.as_str());
-            Some(if *skip { None } else { Some(a.clone()) })
-        })
-        .flatten()
-        .collect();
-    positionals(&kept).into_iter().map(str::to_string).collect()
-}
-
 /// One git, gh or search statement of a command line.
 struct Statement {
     verb: String,
@@ -566,6 +499,9 @@ fn statements(command: &str) -> Vec<Statement> {
     let mut lost = false;
     // A subshell's `cd` ends with it.
     let mut outer: Vec<(Option<String>, bool)> = Vec::new();
+    // `L=/abs/path; cd $L`: a variable the line itself sets to a literal
+    // directory names that directory (#422).
+    let mut vars: FxHashMap<String, String> = FxHashMap::default();
     let mut i = 0;
     while i < ws.len() {
         if ws[i] == "(" {
@@ -580,6 +516,19 @@ fn statements(command: &str) -> Vec<Statement> {
             }
             i += 1;
             continue;
+        }
+        let head = i == 0 || is_operator(&ws[i - 1]) || ws[i - 1] == "export";
+        if let Some((name, value)) = ws[i].split_once('=').filter(|_| head) {
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                let value = expand_home(&substitute(value, &vars));
+                if is_unresolvable(&value) {
+                    vars.remove(name);
+                } else {
+                    vars.insert(name.to_string(), value);
+                }
+                i += 1;
+                continue;
+            }
         }
         let prog = Path::new(&ws[i])
             .file_name()
@@ -606,7 +555,7 @@ fn statements(command: &str) -> Vec<Statement> {
                 i = k;
                 continue;
             }
-            if let Some(target) = target.map(|w| expand_home(w)) {
+            if let Some(target) = target.map(|w| expand_home(&substitute(w, &vars))) {
                 let target = &target;
                 if is_unresolvable(target) {
                     lost = true;
@@ -649,7 +598,7 @@ fn statements(command: &str) -> Vec<Statement> {
             while j < ws.len() && !is_operator(&ws[j]) {
                 let w = &ws[j];
                 if prog == "git" && w == "-C" {
-                    if let Some(d) = ws.get(j + 1).map(|d| expand_home(d)) {
+                    if let Some(d) = ws.get(j + 1).map(|d| expand_home(&substitute(d, &vars))) {
                         let d = &d;
                         if is_unresolvable(d) {
                             dir_lost = true;
@@ -663,7 +612,12 @@ fn statements(command: &str) -> Vec<Statement> {
                     j += 2;
                     continue;
                 }
-                if prog == "git" && w == "-c" {
+                if prog == "git"
+                    && matches!(
+                        w.as_str(),
+                        "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+                    )
+                {
                     j += 2;
                     continue;
                 }
@@ -770,6 +724,40 @@ fn pattern_names(pattern: &str) -> Vec<String> {
 
 /// A directory only the shell could expand: a variable, a command
 /// substitution, another user's home (`~user`).
+/// `$NAME` and `${NAME}` replaced by what the line set them to; any other
+/// expansion is left for `is_unresolvable` to see.
+fn substitute(word: &str, vars: &FxHashMap<String, String>) -> String {
+    let mut out = String::new();
+    let mut rest = word;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let (name, len) = match after.strip_prefix('{') {
+            Some(braced) => braced
+                .find('}')
+                .map_or(("", 0), |end| (&braced[..end], end + 2)),
+            None => {
+                let end = after
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(after.len());
+                (&after[..end], end)
+            }
+        };
+        match vars.get(name) {
+            Some(value) => {
+                out.push_str(value);
+                rest = &after[len..];
+            }
+            None => {
+                out.push('$');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn is_unresolvable(dir: &str) -> bool {
     dir.contains('$') || dir.contains('`') || dir.starts_with('~')
 }
@@ -811,38 +799,13 @@ fn join_dir(base: Option<&str>, dir: &str) -> String {
 }
 
 pub fn detect(event: Event, command: &str) -> Option<Detected> {
-    // The hook runs before the line does: a `git add` earlier on it has not
-    // staged anything yet. It is replayed on a copy of the index, so the
-    // commit that follows is reviewed for what it will start from.
-    let mut steps = Vec::new();
-    let mut unplannable = false;
+    // A line that stages before it commits is not a plain commit: the gate
+    // asks for the staging to run first instead of predicting it.
+    let mut stages = false;
     let mut summary = None;
     for st in statements(command).into_iter().filter(|st| !st.lost) {
-        match st.verb.as_str() {
-            "add" | "stage" if !st.args.iter().any(|a| is_interactive_add(a)) => {
-                steps.push(Replay {
-                    dir: st.dir.clone(),
-                    args: std::iter::once("add".to_string())
-                        .chain(st.args.iter().cloned())
-                        .collect(),
-                });
-            }
-            // `git rm` also deletes the file; on the copy only the index entry goes.
-            "rm" => steps.push(Replay {
-                dir: st.dir.clone(),
-                args: ["rm", "--cached", "-q"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .chain(st.args.iter().cloned())
-                    .collect(),
-            }),
-            // Anything else that writes the index or the files an add reads.
-            "add" | "stage" | "mv" | "reset" | "restore" | "checkout" | "stash" | "apply"
-            | "am" | "update-index" | "read-tree" | "checkout-index" | "switch" | "merge"
-            | "cherry-pick" | "revert" | "pull" | "rebase" | "clean" => {
-                unplannable = true;
-            }
-            _ => {}
+        if STAGING_VERBS.contains(&st.verb.as_str()) {
+            stages = true;
         }
         if let Some(mut detected) = detect_statement(event, &st) {
             // `git status` only summarises: a diff later on the same line is
@@ -851,17 +814,8 @@ pub fn detect(event: Event, command: &str) -> Option<Detected> {
                 summary.get_or_insert(detected);
                 continue;
             }
-            if let Trigger::Commit {
-                staging,
-                steps: planned,
-                ..
-            } = &mut detected.trigger
-            {
-                if unplannable {
-                    *staging = Staging::Worktree;
-                } else {
-                    *planned = std::mem::take(&mut steps);
-                }
+            if let Trigger::Commit { plain, .. } = &mut detected.trigger {
+                *plain &= !stages;
             }
             return Some(detected);
         }
@@ -869,16 +823,30 @@ pub fn detect(event: Event, command: &str) -> Option<Detected> {
     summary
 }
 
-/// An add that asks the terminal which hunks to take: its outcome cannot
-/// be planned.
-fn is_interactive_add(arg: &str) -> bool {
-    matches!(
-        arg,
-        "-p" | "--patch" | "-i" | "--interactive" | "-e" | "--edit" | "--pathspec-from-file"
-    ) || arg.starts_with("--pathspec-from-file=")
-}
+/// Verbs that write the index or the files a commit reads.
+const STAGING_VERBS: [&str; 20] = [
+    "add",
+    "stage",
+    "rm",
+    "mv",
+    "reset",
+    "restore",
+    "checkout",
+    "stash",
+    "apply",
+    "am",
+    "update-index",
+    "read-tree",
+    "checkout-index",
+    "switch",
+    "merge",
+    "cherry-pick",
+    "revert",
+    "pull",
+    "rebase",
+    "clean",
+];
 
-/// Every pathspec of a commit: the positionals, and whatever follows `--`.
 fn pathspecs(args: &[String]) -> Vec<String> {
     let mut paths: Vec<String> = positionals(args).into_iter().map(str::to_string).collect();
     if let Some(i) = args.iter().position(|a| a == "--") {
@@ -916,48 +884,6 @@ fn is_summary_only(args: &[String]) -> bool {
     summary && !patch
 }
 
-/// Value flags of `git push`: the next word is no repository or refspec.
-const PUSH_VALUE_FLAGS: &[&str] = &["-o", "--push-option", "--repo", "--receive-pack", "--exec"];
-
-/// The ref a push line sends: its repository and its one refspec that does
-/// not delete. `None` when every refspec deletes.
-fn pushed(args: &[String]) -> Option<Pushed> {
-    if args
-        .iter()
-        .any(|a| matches!(a.as_str(), "--all" | "--branches" | "--mirror"))
-    {
-        return Some(Pushed::Unresolved);
-    }
-    let words = positionals_skipping(args, PUSH_VALUE_FLAGS);
-    let Some((remote, refspecs)) = words.split_first() else {
-        return Some(Pushed::Upstream);
-    };
-    let sent: Vec<&str> = refspecs
-        .iter()
-        .map(|r| r.strip_prefix('+').unwrap_or(r))
-        .filter(|r| !r.starts_with(':'))
-        .collect();
-    let spec = match sent.as_slice() {
-        [] if refspecs.is_empty() => "HEAD",
-        [] => return None,
-        [one] => one,
-        _ => return Some(Pushed::Unresolved),
-    };
-    let (src, dst) = match spec.split_once(':') {
-        Some((src, dst)) => (src, Some(dst)),
-        None => (spec, None),
-    };
-    let unnamed = |w: &str| w.is_empty() || w.contains('*') || is_unresolvable(w);
-    if unnamed(remote) || unnamed(src) || dst.is_some_and(unnamed) {
-        return Some(Pushed::Unresolved);
-    }
-    Some(Pushed::Ref {
-        remote: remote.clone(),
-        src: src.to_string(),
-        dst: dst.map(str::to_string),
-    })
-}
-
 /// The value of `--long v`, `--long=v`, `-s v` or `-sv`.
 fn flag_value(args: &[String], long: &str, short: &str) -> Option<String> {
     let mut it = args.iter();
@@ -987,64 +913,18 @@ fn detect_statement(event: Event, st: &Statement) -> Option<Detected> {
             }
             // `-S` signs: its key id is attached, never the next word.
             let unsigned: Vec<String> = args.iter().filter(|a| *a != "-S").cloned().collect();
-            let paths = pathspecs(&unsigned);
-            let staging = if !paths.is_empty() {
-                if has("--include") || short_flag('i') {
-                    Staging::Include(paths)
-                } else {
-                    Staging::Only(paths)
-                }
-            } else if has("--all") || short_flag('a') {
-                Staging::All
-            } else {
-                Staging::Index
-            };
+            let plain = pathspecs(&unsigned).is_empty()
+                && !has("--all")
+                && !short_flag('a')
+                && !has("--include")
+                && !short_flag('i')
+                && !has("--only")
+                && !short_flag('o')
+                && !args.iter().any(|a| a.starts_with("--pathspec-from-file"));
             Trigger::Commit {
                 amend: has("--amend"),
-                staging,
-                steps: Vec::new(),
+                plain,
             }
-        }
-        (Event::PostToolUse, "commit") => {
-            if has("--dry-run") {
-                return None;
-            }
-            Trigger::Committed {
-                amend: has("--amend"),
-                onto: None,
-            }
-        }
-        (Event::PreToolUse, "merge" | "cherry-pick") => {
-            if ["--abort", "--continue", "--skip", "--quit"]
-                .iter()
-                .any(|f| has(f))
-            {
-                return None;
-            }
-            // Flags the commit verbs read a value after but these do not:
-            // `-S` signs with an attached key id, `--squash` is a switch.
-            let switches: Vec<String> = args
-                .iter()
-                .filter(|a| !matches!(a.as_str(), "-S" | "--squash" | "--gpg-sign"))
-                .cloned()
-                .collect();
-            let targets: Vec<String> = positionals_skipping(&switches, MERGE_VALUE_FLAGS);
-            if verb == "merge" {
-                Trigger::Merge(targets.into_iter().next()?)
-            } else if targets.is_empty() {
-                return None;
-            } else {
-                Trigger::CherryPick(targets)
-            }
-        }
-        (Event::PreToolUse, "push") => {
-            if ["--tags", "--delete", "--dry-run"].iter().any(|f| has(f))
-                || short_flag('d')
-                || short_flag('n')
-            {
-                return None;
-            }
-            Trigger::Push(pushed(args)?)
         }
         (Event::PreToolUse, "gh pr") => {
             if args.first().map(String::as_str) != Some("create") {
@@ -1097,13 +977,6 @@ fn git_out(root: &Path, args: &[&str]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn same_dir(a: &Path, b: &Path) -> bool {
-    match (dunce::canonicalize(a), dunce::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
-}
-
 fn first_reachable(root: &Path, revs: &[&str]) -> Option<String> {
     revs.iter()
         .find(|r| git_out(root, &["rev-parse", "--verify", "--quiet", r]).is_some())
@@ -1115,7 +988,7 @@ fn first_reachable(root: &Path, revs: &[&str]) -> Option<String> {
 /// copy: `write-tree` on the real index takes its lock from under a
 /// concurrent `git add`.
 fn staged_range(root: &Path, base: Option<&str>) -> Option<String> {
-    let staged = crate::git::capture_planned(root, crate::git::PlanStart::Index, &[]).ok()?;
+    let staged = crate::git::capture_planned(root, &[]).ok()?;
     Some(format!("{}..{}", base.unwrap_or(&staged.base), staged.tree))
 }
 
@@ -1133,7 +1006,7 @@ fn own_range(root: &Path, staged: bool, files: &[String]) -> Option<String> {
         plan.push(step(&["add", "-A", "--"], "literal"));
     }
     plan.push(step(&["reset", "-q", "--", ":/"], "exclude,literal"));
-    let snapshot = crate::git::capture_planned(root, crate::git::PlanStart::Index, &plan).ok()?;
+    let snapshot = crate::git::capture_planned(root, &plan).ok()?;
     Some(format!("{}..{}", snapshot.base, snapshot.tree))
 }
 
@@ -1147,11 +1020,9 @@ fn resolve_dir(cwd: &Path, dir: Option<&str>) -> PathBuf {
     }
 }
 
-/// The range whose impact the tool call is about to make permanent. `cwd`
-/// is where the agent ran the line and `here` where the triggering
-/// statement runs, for the paths the line spells.
-pub fn range_for(root: &Path, cwd: &Path, here: &Path, trigger: &Trigger) -> Option<String> {
-    let parent = || git_out(root, &["rev-parse", "--verify", "--quiet", "HEAD~1"]);
+/// The range a trigger read before git runs is about. `cwd` is where the
+/// agent ran the line; a landed record carries its own range.
+pub fn range_for(root: &Path, trigger: &Trigger) -> Option<String> {
     Some(match trigger {
         Trigger::Inspect {
             staged,
@@ -1159,52 +1030,17 @@ pub fn range_for(root: &Path, cwd: &Path, here: &Path, trigger: &Trigger) -> Opt
         } if own.others > 0 => own_range(root, *staged, &own.files)?,
         Trigger::Inspect { staged: false, .. } => "HEAD".to_string(),
         Trigger::Inspect { staged: true, .. } => staged_range(root, None)?,
-        Trigger::Commit {
-            amend,
-            staging: Staging::Worktree,
-            ..
-        } => {
-            if *amend {
-                parent()?
+        Trigger::Commit { amend, .. } => {
+            let base = if *amend {
+                Some(git_out(
+                    root,
+                    &["rev-parse", "--verify", "--quiet", "HEAD~1"],
+                )?)
             } else {
-                "HEAD".to_string()
-            }
+                None
+            };
+            staged_range(root, base.as_deref())?
         }
-        Trigger::Commit {
-            amend,
-            staging,
-            steps,
-        } => {
-            let base = if *amend { Some(parent()?) } else { None };
-            if !trigger.is_preview() {
-                return staged_range(root, base.as_deref());
-            }
-            planned_range(root, cwd, here, staging, steps, base.as_deref())?
-        }
-        Trigger::Committed { onto, .. } => format!("{}..HEAD", onto.as_deref()?),
-        Trigger::Merge(target) => {
-            // Catching up with the branch's own upstream brings in commits
-            // that already landed there: nothing for this session to review.
-            let tip = |rev: &str| git_out(root, &["rev-parse", "--verify", "--quiet", rev]);
-            if tip(&format!("{target}^{{commit}}")).is_some_and(|t| tip("@{upstream}") == Some(t)) {
-                return None;
-            }
-            let base = git_out(root, &["merge-base", "HEAD", target])?;
-            format!("{base}..{target}")
-        }
-        Trigger::CherryPick(targets) => picked_range(root, targets)?,
-        Trigger::Push(Pushed::Upstream) => {
-            if first_reachable(root, &["@{upstream}"]).is_some() {
-                "@{upstream}..HEAD".to_string()
-            } else {
-                // Without one, git sends the branch to `origin` by its name.
-                push_range(root, "origin", "HEAD", None)?
-            }
-        }
-        Trigger::Push(Pushed::Ref { remote, src, dst }) => {
-            push_range(root, remote, src, dst.as_deref())?
-        }
-        Trigger::Push(Pushed::Unresolved) => return None,
         Trigger::PullRequest { base, head } => {
             // `--head` opens the PR from the branch as pushed.
             let head = match head {
@@ -1220,123 +1056,138 @@ pub fn range_for(root: &Path, cwd: &Path, here: &Path, trigger: &Trigger) -> Opt
             let merge_base = git_out(root, &["merge-base", &base, &head])?;
             format!("{merge_base}..{head}")
         }
+        Trigger::Landed { .. } => return None,
     })
 }
 
-/// What a push of `src` sends to `remote`'s `dst` (`src`'s own branch when
-/// the line names none): the commits past the remote's copy of that branch,
-/// or past where `src` left the remote's default branch when it has none.
-/// `None` for a ref git would refuse to push, or a remote it does not know.
-fn push_range(root: &Path, remote: &str, src: &str, dst: Option<&str>) -> Option<String> {
-    let exists = |rev: &str| git_out(root, &["rev-parse", "--verify", "--quiet", rev]).is_some();
-    let dst = match dst {
-        Some(dst) => dst.to_string(),
-        None => git_out(root, &["rev-parse", "--symbolic-full-name", src])
-            .filter(|full| full.starts_with("refs/"))?,
+/// What a line recorded in each repository it may have touched, as its
+/// `PreToolUse` found them: `HEAD` (empty on an unborn branch) and every
+/// remote-tracking ref.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Before {
+    root: PathBuf,
+    head: String,
+    remotes: Vec<(String, String)>,
+}
+
+fn refs_now(root: &Path) -> Option<Before> {
+    let head = match crate::git::run_git(root, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
+        Ok(head) => head.trim().to_string(),
+        Err(crate::git::GitError::CommandFailed(_)) => String::new(),
+        Err(_) => return None,
     };
-    if !exists(&format!("{src}^{{commit}}")) {
+    let remotes = git_out(
+        root,
+        &[
+            "for-each-ref",
+            // `origin/HEAD` names another ref: not a ref a push moves.
+            "--format=%(if)%(symref)%(then)%(else)%(refname) %(objectname)%(end)",
+            "refs/remotes",
+        ],
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|l| l.split_once(' '))
+    .map(|(r, o)| (r.to_string(), o.to_string()))
+    .collect();
+    Some(Before {
+        root: root.to_path_buf(),
+        head,
+        remotes,
+    })
+}
+
+/// The record one line leaves for its own `PostToolUse`: per session and
+/// command, so another session's commit is never this line's.
+fn before_key(command: &str, session: Option<&str>) -> String {
+    let line = Fnv::new().feed(command.as_bytes()).0;
+    session_key(&format!("before-{line:016x}"), session)
+}
+
+/// What the line recorded in `before.root`, by git's own reflog: a push
+/// (what a remote-tracking ref moved over), else a commit, merge,
+/// cherry-pick or revert on `HEAD`. A checkout, reset, pull or rebase moved
+/// `HEAD` without recording this session's change, and is not reviewed.
+/// The count is of the other refs the same push moved.
+fn landed(before: &Before) -> Option<(String, &'static str, usize)> {
+    let root = before.root.as_path();
+    let now = refs_now(root)?;
+    let old_of = |name: &str| {
+        before
+            .remotes
+            .iter()
+            .find(|(r, _)| r == name)
+            .map(|(_, o)| o.clone())
+    };
+    let pushed: Vec<&(String, String)> = now
+        .remotes
+        .iter()
+        .filter(|(name, new)| {
+            old_of(name).as_deref() != Some(new.as_str())
+                && git_out(root, &["reflog", "-1", "--format=%gs", name])
+                    .is_some_and(|s| s.starts_with("update by push"))
+        })
+        .collect();
+    if let Some((name, new)) = pushed.first() {
+        // What the push itself moved the ref over: a `pull` on the same line
+        // moves it first, and the value this line started from would count
+        // the commits that pull brought in as pushed (#462).
+        let moved_over = git_out(
+            root,
+            &["rev-parse", "--verify", "--quiet", &format!("{name}@{{1}}")],
+        );
+        let base = match moved_over.or_else(|| old_of(name)) {
+            Some(old) => old,
+            // A new branch: the commits past where it left the remote's default.
+            None => {
+                let remote = name.strip_prefix("refs/remotes/")?.split('/').next()?;
+                let default = ["HEAD", "main", "master"]
+                    .iter()
+                    .map(|b| format!("refs/remotes/{remote}/{b}"))
+                    .find(|r| r != name && crate::git::rev_oid(root, r).is_some())?;
+                git_out(root, &["merge-base", &default, new])?
+            }
+        };
+        return Some((format!("{base}..{new}"), "push", pushed.len() - 1));
+    }
+    if now.head == before.head || now.head.is_empty() {
         return None;
     }
-    let tracking = |branch: &str| format!("refs/remotes/{remote}/{branch}");
-    let copy = dst
-        .strip_prefix("refs/heads/")
-        .or_else(|| (!dst.starts_with("refs/")).then_some(dst.as_str()))
-        .map(tracking)
-        .filter(|copy| exists(copy));
-    let base = match copy {
-        Some(copy) => copy,
-        None => {
-            let default = ["HEAD", "main", "master"]
-                .into_iter()
-                .map(tracking)
-                .find(|r| exists(r))?;
-            git_out(root, &["merge-base", &default, src])?
+    let head = now.head.as_str();
+    let subject = git_out(root, &["reflog", "-1", "--format=%gs", "HEAD"])?;
+    let action = subject.split(':').next().unwrap_or_default();
+    let empty = || crate::git::empty_tree_oid(root);
+    let verb = match action {
+        "commit (initial)" => return Some((format!("{}..{head}", empty()), "commit", 0)),
+        "commit (amend)" => {
+            let parent = git_out(root, &["rev-parse", "--verify", "--quiet", "HEAD~1"]);
+            return Some((
+                format!("{}..{head}", parent.unwrap_or_else(empty)),
+                "commit",
+                0,
+            ));
         }
+        "commit" | "commit (merge)" => "commit",
+        "cherry-pick" => "cherry-pick",
+        "revert" => "revert",
+        // Catching up with the branch's own upstream brings in commits that
+        // already landed there: nothing for this session to review.
+        a if a.starts_with("merge ") => {
+            if subject.contains("Fast-forward")
+                && crate::git::rev_oid(root, "@{upstream}").as_deref() == Some(head)
+            {
+                return None;
+            }
+            "merge"
+        }
+        _ => return None,
     };
-    Some(format!("{base}..{src}"))
-}
-
-/// The tree `git commit` will start from once the line's own staging ran,
-/// captured on a copy of the index: `HEAD..<tree>`, or `HEAD~1..<tree>` for
-/// an amend. Pre-commit hooks may still rewrite it; the landed commit is
-/// checked after.
-fn planned_range(
-    root: &Path,
-    cwd: &Path,
-    here: &Path,
-    staging: &Staging,
-    steps: &[Replay],
-    base: Option<&str>,
-) -> Option<String> {
-    // A step run in another repository stages nothing this commit takes.
-    let top = |dir: &Path| git_out(dir, &["rev-parse", "--show-toplevel"]).map(PathBuf::from);
-    let mut plan: Vec<crate::git::PlanStep> = steps
-        .iter()
-        .map(|s| (resolve_dir(cwd, s.dir.as_deref()), s.args.clone()))
-        .filter(|(dir, _)| dir.as_path() == here || top(dir).is_some_and(|t| same_dir(&t, root)))
-        .collect();
-    let own = |flags: &[&str], paths: &[String]| {
-        let args = flags
-            .iter()
-            .map(|f| f.to_string())
-            .chain(paths.iter().cloned())
-            .collect();
-        (here.to_path_buf(), args)
-    };
-    let start = match staging {
-        Staging::All => {
-            plan.push(own(&["add", "-u"], &[]));
-            crate::git::PlanStart::Index
-        }
-        // A pathspec commit takes the paths the index already knows, never
-        // an untracked file under them.
-        Staging::Include(paths) => {
-            plan.push(own(&["add", "-u", "--"], paths));
-            crate::git::PlanStart::Index
-        }
-        // `--only` then drops whatever else was staged back to `HEAD`.
-        Staging::Only(paths) => {
-            plan.push(own(&["add", "-u", "--"], paths));
-            let others: Vec<String> = std::iter::once(":/".to_string())
-                .chain(paths.iter().map(|p| format!(":(exclude){p}")))
-                .collect();
-            plan.push(own(&["reset", "-q", "--"], &others));
-            crate::git::PlanStart::Index
-        }
-        Staging::Index | Staging::Worktree => crate::git::PlanStart::Index,
-    };
-    let snapshot = crate::git::capture_planned(root, start, &plan).ok()?;
-    Some(format!(
-        "{}..{}",
-        base.unwrap_or(&snapshot.base),
-        snapshot.tree
-    ))
-}
-
-/// What a cherry-pick lands: one commit or one range is its own diff; several
-/// are applied in order onto a copy of `HEAD`, so a picked chain with a gap
-/// is reviewed without the commits it skips (#380).
-fn picked_range(root: &Path, targets: &[String]) -> Option<String> {
-    if let [one] = targets {
-        return Some(if one.contains("..") {
-            one.clone()
-        } else {
-            format!("{one}^..{one}")
-        });
+    if before.head.is_empty() {
+        return Some((format!("{}..{head}", empty()), verb, 0));
     }
-    let mut commits = Vec::new();
-    for target in targets {
-        if target.contains("..") {
-            let listed = git_out(root, &["rev-list", "--reverse", target])?;
-            commits.extend(listed.lines().map(str::to_string));
-        } else {
-            let spec = format!("{target}^{{commit}}");
-            commits.push(git_out(root, &["rev-parse", "--verify", "--quiet", &spec])?);
-        }
-    }
-    let snapshot =
-        crate::git::capture_planned(root, crate::git::PlanStart::Picked(&commits), &[]).ok()?;
-    Some(format!("{}..{}", snapshot.base, snapshot.tree))
+    crate::git::run_git(root, &["merge-base", "--is-ancestor", &before.head, head])
+        .is_ok()
+        .then(|| (format!("{}..{head}", before.head), verb, 0))
 }
 
 /// FNV-1a, 64-bit: no dependency, and no collision that matters at the
@@ -1475,7 +1326,27 @@ fn unhashable_identity(path: &Path) -> String {
     )
 }
 
+/// Where the hook keeps what it delivered and its log. A cache it cannot
+/// write disabled the dedupe and the retry cap without a word, and every
+/// commit reran the pipeline (#407): the temporary directory stands in.
 fn cache_root() -> Option<PathBuf> {
+    let preferred = configured_cache_root();
+    if let Some(dir) = preferred.as_ref().filter(|d| writable(d)) {
+        return Some(dir.clone());
+    }
+    let user = std::env::var("USER").unwrap_or_default();
+    let fallback = std::env::temp_dir().join(format!("diffctx-{user}"));
+    writable(&fallback).then_some(fallback)
+}
+
+fn writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".probe-{}", std::process::id()));
+    std::fs::create_dir_all(dir).is_ok()
+        && std::fs::write(&probe, b"").is_ok()
+        && std::fs::remove_file(&probe).is_ok()
+}
+
+fn configured_cache_root() -> Option<PathBuf> {
     let base = std::env::var_os("DIFFCTX_CACHE_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from))
@@ -1656,6 +1527,8 @@ struct Trace {
     verb: Option<&'static str>,
     root: Option<PathBuf>,
     range: Option<String>,
+    /// Why a one-line answer was given in place of a review, for the log.
+    noted: Option<Silence>,
 }
 
 /// Why the hook stayed silent, as its log line names it; `shown` otherwise.
@@ -1664,10 +1537,7 @@ type Silence = &'static str;
 fn verb_of(trigger: &Trigger) -> &'static str {
     match trigger {
         Trigger::Commit { .. } => "commit",
-        Trigger::Committed { .. } => "committed",
-        Trigger::Merge(_) => "merge",
-        Trigger::CherryPick(_) => "cherry-pick",
-        Trigger::Push(_) => "push",
+        Trigger::Landed { verb, .. } => verb,
         Trigger::PullRequest { .. } => "pr",
         Trigger::Inspect { .. } => "inspect",
     }
@@ -1713,24 +1583,42 @@ fn prepare(
     trace.verb = Some(verb_of(&detected.trigger));
     let root = repo_root(payload, detected.dir.as_deref()).ok_or("not-git")?;
     trace.root = Some(root.clone());
-    let head_before = head_record(&root, command, trace.session.as_deref());
-    match &mut detected.trigger {
-        Trigger::Committed { amend, onto } => {
-            *onto = Some(committed_just_now(&root, &head_before, *amend)?);
-        }
-        Trigger::Inspect { staged, own } => *own = own_changes(&root, payload, *staged)?,
-        _ if event == Event::PreToolUse => record_head(&root, &head_before),
-        _ => {}
+    if let Trigger::Inspect { staged, own } = &mut detected.trigger {
+        *own = own_changes(&root, payload, *staged)?;
     }
-    let cwd = payload_cwd(payload).ok_or("not-git")?;
-    let here = resolve_dir(&cwd, detected.dir.as_deref());
+    // A PR without a range names a ref nothing here resolves: said so,
+    // never replaced by the current branch (#416).
     let unresolved = match detected.trigger {
-        // A push or PR without a range names a ref nothing here resolves:
-        // said so, never replaced by the current branch (#416).
-        Trigger::Push(_) | Trigger::PullRequest { .. } => "unresolved-ref",
+        Trigger::PullRequest { .. } => "unresolved-ref",
         _ => "no-range",
     };
-    let range = range_for(&root, &cwd, &here, &detected.trigger).ok_or(unresolved)?;
+    let range = range_for(&root, &detected.trigger).ok_or(unresolved)?;
+    prepared(root, range, detected.trigger, trace)
+}
+
+/// What the line recorded, from the refs its `PreToolUse` left: the first
+/// repository it touched that moved.
+fn prepare_landed(command: &str, trace: &mut Trace) -> Result<Prepared, Silence> {
+    let key = before_key(command, trace.session.as_deref());
+    let before: Vec<Before> = seen_headline(&key, SEEN_TTL)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .ok_or("no-record")?;
+    unmark(&key);
+    let (root, (range, verb, also)) = before
+        .iter()
+        .find_map(|b| Some((b.root.clone(), landed(b)?)))
+        .ok_or("nothing-landed")?;
+    trace.verb = Some(verb);
+    trace.root = Some(root.clone());
+    prepared(root, range, Trigger::Landed { verb, also }, trace)
+}
+
+fn prepared(
+    root: PathBuf,
+    range: String,
+    trigger: Trigger,
+    trace: &mut Trace,
+) -> Result<Prepared, Silence> {
     trace.range = Some(range.clone());
     let identity = result_identity(&root, &range).ok_or("clean")?;
     let session = trace.session.as_deref();
@@ -1740,7 +1628,7 @@ fn prepare(
     Ok(Prepared {
         root,
         range,
-        trigger: detected.trigger,
+        trigger,
         record_key: session_key(&format!("rec-{identity}"), session),
         tries_key: session_key(&format!("try-{identity}"), session),
         key,
@@ -1748,18 +1636,62 @@ fn prepare(
     })
 }
 
+/// Before a line that records or publishes commits runs: the refs of every
+/// repository it names (the cwd's, a `cd` or `-C` target), for its own
+/// `PostToolUse` to compare against. Nothing about what it will stage is
+/// guessed. A directory only the shell can name, or a git the shell alone
+/// runs, is said to be unread.
+fn record_before(
+    payload: &serde_json::Value,
+    command: &str,
+    trace: &mut Trace,
+) -> Result<(), Silence> {
+    if hides_git(command) {
+        return Err("unsupported-syntax");
+    }
+    let cwd = payload_cwd(payload).ok_or("not-git")?;
+    // The cwd's own repository always: a statement this parser misreads
+    // still records there.
+    let mut roots: Vec<PathBuf> = git_out(&cwd, &["rev-parse", "--show-toplevel"])
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    for st in statements(command)
+        .into_iter()
+        .filter(|st| RECORDING_VERBS.contains(&st.verb.as_str()))
+    {
+        if st.lost {
+            return Err("unresolved-dir");
+        }
+        let top = git_out(
+            &resolve_dir(&cwd, st.dir.as_deref()),
+            &["rev-parse", "--show-toplevel"],
+        );
+        if let Some(top) = top.map(PathBuf::from).filter(|t| !roots.contains(t)) {
+            roots.push(top);
+        }
+    }
+    let before: Vec<Before> = roots.iter().filter_map(|r| refs_now(r)).collect();
+    if before.is_empty() {
+        return Err("not-git");
+    }
+    trace.root = before.first().map(|b| b.root.clone());
+    let json = serde_json::to_string(&before).map_err(|_| "error:record")?;
+    mark_seen_with(&before_key(command, trace.session.as_deref()), &json);
+    Ok(())
+}
+
+/// The verbs whose effect is a commit or a pushed ref.
+const RECORDING_VERBS: [&str; 5] = ["commit", "merge", "cherry-pick", "revert", "push"];
+
 /// A git command only the shell could run — in `$(…)`, backticks, `eval`,
 /// `sh -c '…'`: what it records cannot be read off the line, and the hook
 /// says it did not try rather than guessing. A substitution elsewhere on the
 /// line (`FP=$(cat f) && git commit`) hides nothing.
 fn hides_git(command: &str) -> bool {
-    const VERBS: [&str; 4] = ["git commit", "git push", "git merge", "git cherry-pick"];
-    let spans = wrapped_spans(command);
-    VERBS.iter().any(|verb| {
-        command
-            .match_indices(verb)
-            .any(|(at, _)| spans.iter().any(|(from, to)| (*from..*to).contains(&at)))
-    })
+    wrapped_spans(command)
+        .iter()
+        .any(|&(from, to)| command.get(from..to).is_some_and(names_a_recording_verb))
 }
 
 /// Byte ranges of `$(…)`, backtick pairs, `eval …` and `-c '…'` bodies.
@@ -1796,11 +1728,12 @@ fn wrapped_spans(command: &str) -> Vec<(usize, usize)> {
                 .find(['\n', ';', '&', '|'])
                 .map_or(bytes.len(), |k| i + k);
             spans.push((i, end));
-        } else if bytes[i..].starts_with(b" -c '") || bytes[i..].starts_with(b" -c \"") {
-            let quote = bytes[i + 4] as char;
-            let end = command[i + 5..]
+        } else if let Some(open) = shell_c_flag(&bytes[i..]) {
+            // `-c`, and clusters ending in it (`-lc`, `-ic`): `bash -lc "…"`.
+            let quote = bytes[i + open] as char;
+            let end = command[i + open + 1..]
                 .find(quote)
-                .map_or(bytes.len(), |k| i + 5 + k);
+                .map_or(bytes.len(), |k| i + open + 1 + k);
             spans.push((i, end));
         }
         i += 1;
@@ -1808,62 +1741,16 @@ fn wrapped_spans(command: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-/// Where a line's `PreToolUse` leaves `HEAD` as it found it, for the same
-/// line's `PostToolUse`: one per session, repository and command.
-fn head_record(root: &Path, command: &str, session: Option<&str>) -> String {
-    let line = Fnv::new()
-        .feed(root.to_string_lossy().as_bytes())
-        .feed(command.as_bytes())
-        .0;
-    session_key(&format!("head-{line:016x}"), session)
-}
-
-/// `HEAD` before git runs; empty on an unborn branch. A `HEAD` git could
-/// not be asked about leaves no record rather than a wrong one.
-fn record_head(root: &Path, record: &str) {
-    match crate::git::run_git(root, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
-        Ok(head) => mark_seen_with(record, head.trim()),
-        Err(crate::git::GitError::CommandFailed(_)) => mark_seen_with(record, ""),
-        Err(_) => unmark(record),
-    }
-}
-
-/// What the line's own commit sits on: the `HEAD` its `PreToolUse` recorded,
-/// once `HEAD` moved on from it, or for an amend that commit's parent. The
-/// tool's result is not in the payload, so a `HEAD` still where the line
-/// found it is a commit that failed, and one moved anywhere else is not
-/// this line's: a commit another session just made used to pass for it
-/// (#406).
-fn committed_just_now(root: &Path, record: &str, amend: bool) -> Result<String, Silence> {
-    let before = seen_headline(record, SEEN_TTL).ok_or("no-head-record")?;
-    unmark(record);
-    let head = crate::git::rev_oid(root, "HEAD").ok_or("no-new-commit")?;
-    let descends = |base: &str| {
-        crate::git::run_git(root, &["merge-base", "--is-ancestor", base, &head]).is_ok()
-    };
-    let parent = |rev: &str| {
-        git_out(
-            root,
-            &["rev-parse", "--verify", "--quiet", &format!("{rev}~1")],
-        )
-    };
-    if head == before {
-        Err("no-new-commit")
-    } else if before.is_empty() {
-        // The branch was unborn: the line made its first commit.
-        Ok(crate::git::empty_tree_oid(root))
-    } else if descends(&before) {
-        Ok(before)
-    } else if amend {
-        match parent(&before) {
-            Some(base) if descends(&base) => Ok(base),
-            // An amended first commit is a first commit again.
-            None if parent(&head).is_none() => Ok(crate::git::empty_tree_oid(root)),
-            _ => Err("foreign-head"),
-        }
-    } else {
-        Err("foreign-head")
-    }
+/// The offset of the opening quote after a ` -c` flag or a short-flag
+/// cluster ending in `c` (` -lc '`), if `rest` starts with one.
+fn shell_c_flag(rest: &[u8]) -> Option<usize> {
+    let flags = rest.strip_prefix(b" -")?;
+    let len = flags.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+    (len > 0
+        && flags[len - 1] == b'c'
+        && flags.get(len) == Some(&b' ')
+        && matches!(flags.get(len + 1), Some(b'\'' | b'"')))
+    .then_some(2 + len + 1)
 }
 
 /// Bytes of transcript read to tell this session's edits apart. A long
@@ -2002,14 +1889,19 @@ fn canonical(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
-fn reminder(headline: &str) -> String {
+fn reminder(event: Event, headline: &str) -> String {
     let what = if headline.trim().is_empty() {
         "reviewed earlier".to_string()
     } else {
         format!("shown earlier in this session: {}", headline.trim())
     };
+    let records = if event == Event::PreToolUse {
+        "records"
+    } else {
+        "recorded"
+    };
     format!(
-        "diffctx: this command records a change whose impact was {what}. Those callers still apply; confirm they were checked before going on."
+        "diffctx: this command {records} a change whose impact was {what}. Those callers still apply; confirm they were checked before going on."
     )
 }
 
@@ -2040,22 +1932,16 @@ const AUTOMATIC_TOKEN_CAP: u32 = 600;
 
 fn lead_of(event: Event, trigger: &Trigger) -> String {
     let lead = match (event, trigger) {
-        (
-            Event::PreToolUse,
-            Trigger::Commit {
-                staging: Staging::Worktree,
-                ..
-            },
-        ) => {
-            "diffctx previewed what this command will record, estimated from the working tree before git runs; the commit is checked again once it lands."
+        (_, Trigger::Commit { .. }) => "diffctx reviewed the index this commit will record.",
+        (_, Trigger::Landed { verb, also: 0 }) => {
+            return format!("diffctx reviewed what this {verb} recorded.");
         }
-        (Event::PreToolUse, t) if t.is_preview() => {
-            "diffctx previewed the index this commit will start from, with the staging on this line applied before git runs; pre-commit hooks may still change it, so the commit is checked again once it lands."
+        (_, Trigger::Landed { verb, also }) => {
+            return format!(
+                "diffctx reviewed the first ref this {verb} moved; {also} other pushed ref(s) are not analysed."
+            );
         }
-        (Event::PreToolUse, _) => "diffctx reviewed the change this command is about to record.",
-        (Event::PostToolUse, Trigger::Committed { .. }) => {
-            "diffctx reviewed the commit that just landed, which is not what was reviewed before it."
-        }
+        (Event::PreToolUse, _) => "diffctx reviewed the commits this pull request proposes.",
         (Event::PostToolUse, Trigger::Inspect { own: None, .. }) => {
             "diffctx reviewed every pending change in this checkout, which you just inspected; without a readable transcript it cannot tell this session's edits from another session's."
         }
@@ -2123,7 +2009,11 @@ fn searched(payload: &serde_json::Value) -> Option<Searched> {
 /// names its changed symbols. Only the changed files are parsed, so a
 /// search for any other name stops here without running the pipeline.
 fn edited_definitions(root: &Path) -> Vec<String> {
-    let Ok(hunks) = crate::git::parse_diff(root, Some("HEAD"), &[]) else {
+    // The pending change as impact reads it, untracked files included: a
+    // name defined only in a new file is still the change's (#448).
+    let Ok((hunks, _)) =
+        crate::pipeline::collect_hunks_with_untracked(root, Some("HEAD"), &[], true, None)
+    else {
         return Vec::new();
     };
     let mut files: Vec<PathBuf> = hunks.iter().map(|h| PathBuf::from(&*h.path)).collect();
@@ -2171,9 +2061,15 @@ fn edited_definitions(root: &Path) -> Vec<String> {
 struct Known {
     answers: std::collections::BTreeMap<String, String>,
     partial: bool,
+    /// Names edited only in comments, formatting or position: their callers
+    /// were not traced, which is no finding that there are none (#498).
+    layout: std::collections::BTreeSet<String>,
 }
 
 fn known_answers(mut output: crate::impact::ImpactOutput) -> Known {
+    let layout = crate::impact::layout_only_names(&output)
+        .map(str::to_string)
+        .collect();
     let mut by_name: std::collections::BTreeMap<String, Vec<crate::impact::ChangedSymbol>> =
         std::collections::BTreeMap::new();
     for sym in std::mem::take(&mut output.changed) {
@@ -2193,7 +2089,7 @@ fn known_answers(mut output: crate::impact::ImpactOutput) -> Known {
         .into_iter()
         .filter(|(_, syms)| {
             syms.iter()
-                .any(|s| !s.callers.is_empty() || s.unresolved.is_some())
+                .any(|s| !s.callers.is_empty() || s.unresolved.is_some() || !s.missed_in.is_empty())
         })
         .map(|(name, syms)| {
             let mut one = crate::impact::ImpactOutput {
@@ -2204,7 +2100,11 @@ fn known_answers(mut output: crate::impact::ImpactOutput) -> Known {
             (name, text)
         })
         .collect();
-    Known { answers, partial }
+    Known {
+        answers,
+        partial,
+        layout,
+    }
 }
 
 /// A search for a name the pending change defines is a search for its
@@ -2254,6 +2154,9 @@ fn search_answer(
         let answer = match known.answers.get(name) {
             Some(text) => format!(
                 "You searched for `{name}`, which the pending change edits; diffctx already analysed what references it:\n{text}"
+            ),
+            None if known.layout.contains(name) => format!(
+                "diffctx: `{name}` is edited by the pending change only in comments, formatting or position, which no caller sees, so its callers were not traced; `diffctx . --symbol {name}` lists them."
             ),
             None if !known.partial => format!(
                 "diffctx: `{name}` is edited by the pending change, and no resolved static caller outside the diff was found in the analysed scope."
@@ -2328,22 +2231,78 @@ fn decide(
                 .map(|c| hook_json(event, &c, false));
         }
     }
-    let prepared = prepare(event, &payload, trace)?;
+    let command = payload["tool_input"]["command"]
+        .as_str()
+        .unwrap_or_default();
+    let recording = names_a_recording_verb(command);
+    if event == Event::PreToolUse && recording {
+        let recorded = record_before(&payload, command, trace);
+        let gated_commit = gate
+            && matches!(
+                detect(event, command).map(|d| d.trigger),
+                Some(Trigger::Commit { .. })
+            );
+        match recorded {
+            Ok(()) if !gated_commit && !command.contains("gh pr create") => {
+                return Err("recorded");
+            }
+            Ok(()) | Err("not-git") => {}
+            Err(why) => return Ok(not_analysed(event, why, trace)),
+        }
+    }
+    if gate && event == Event::PreToolUse {
+        if let Some(Trigger::Commit { plain: false, .. }) =
+            detect(event, command).map(|d| d.trigger)
+        {
+            trace.noted = Some("denied");
+            return Ok(serde_json::json!({ "hookSpecificOutput": {
+                "hookEventName": event.name(),
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "diffctx's strict gate reviews the index a commit records, so it does not run a commit that stages for itself. Run the staging (`git add`, `git rm`, ...) as its own command, then `git commit` without paths, `-a`, `-i` or `--pathspec-from-file`.",
+            }})
+            .to_string());
+        }
+    }
+    let prepared = match if event == Event::PostToolUse && recording {
+        prepare_landed(command, trace).or_else(|why| match why {
+            "no-record" | "nothing-landed" => prepare(event, &payload, trace),
+            why => Err(why),
+        })
+    } else {
+        prepare(event, &payload, trace)
+    } {
+        Ok(p) => p,
+        // A commit or push the hook could not read is said so, so that no
+        // block means the hook did not run, never "reviewed, nothing" (#464).
+        Err(why @ ("unsupported-syntax" | "unresolved-dir"))
+            if event == Event::PreToolUse && recording =>
+        {
+            return Ok(not_analysed(event, why, trace));
+        }
+        Err(why) => return Err(why),
+    };
     if event == Event::PreToolUse && is_seen(&prepared.record_key) {
         return Err("seen");
     }
+    let landed = matches!(prepared.trigger, Trigger::Landed { .. });
     match (&prepared.shown, event) {
         // An answer that was empty stays empty: no reminder of callers that
-        // were never listed, and the log says why the hook was silent.
+        // were never listed. A landed record still says it in one line.
         (Some(d), _) if !d.partial && d.headline.is_empty() => {
             if event == Event::PreToolUse {
                 mark_seen(&prepared.record_key);
             }
+            if landed {
+                return Ok(nothing_reached(event, trace));
+            }
             return Err("empty");
         }
-        (Some(d), Event::PreToolUse) if !d.partial => {
+        // What landed was reviewed before (the gate, an inspection, a manual
+        // run): pointed at, never silence, which read as no review (#501).
+        (Some(d), _) if !d.partial && (event == Event::PreToolUse || landed) => {
             mark_seen(&prepared.record_key);
-            return Ok(hook_json(event, &reminder(&d.headline), false));
+            trace.noted = Some("reminder");
+            return Ok(hook_json(event, &reminder(event, &d.headline), false));
         }
         (Some(d), Event::PostToolUse) if !d.partial => return Err("seen"),
         _ => {}
@@ -2378,11 +2337,56 @@ fn decide(
     if event == Event::PreToolUse {
         mark_seen(&record_key);
     }
-    answer.map(|a| hook_json(event, &a.context, gate && !a.partial))
+    match answer {
+        Err("empty") if event == Event::PreToolUse || landed => Ok(nothing_reached(event, trace)),
+        answer => answer.map(|a| {
+            let deny = gate && !a.partial;
+            if deny {
+                trace.noted = Some("denied");
+            }
+            hook_json(event, &a.context, deny)
+        }),
+    }
 }
 
-/// The log is cut over to `hook.log.1` past this size: a few thousand runs.
-const LOG_MAX_BYTES: u64 = 256 * 1024;
+/// A line that records or publishes commits: the events whose silence would
+/// otherwise read as a clean review.
+/// One line, so that no block means the hook did not run (#464).
+fn nothing_reached(event: Event, trace: &mut Trace) -> String {
+    trace.noted = Some("empty");
+    let range = trace.range.as_deref().unwrap_or("this change");
+    hook_json(
+        event,
+        &format!("diffctx: {range} reaches nothing outside the diff."),
+        false,
+    )
+}
+
+fn not_analysed(event: Event, why: Silence, trace: &mut Trace) -> String {
+    trace.noted = Some(why);
+    let how = if why == "unresolved-dir" {
+        "it changes into a directory the hook cannot resolve"
+    } else {
+        "its git runs inside a subshell, eval or command substitution"
+    };
+    hook_json(
+        event,
+        &format!(
+            "diffctx did not analyse this command: {how}. Run `diffctx <repo> --diff --mode impact` in that repository before going on."
+        ),
+        false,
+    )
+}
+
+fn names_a_recording_verb(command: &str) -> bool {
+    let words = || command.split(|c: char| !(c.is_alphanumeric() || c == '-'));
+    words().any(|w| w == "git")
+        && words().any(|w| matches!(w, "commit" | "push" | "merge" | "cherry-pick" | "revert"))
+}
+
+/// The log is cut over to `hook.log.1` past this size: tens of thousands of
+/// runs, so an audit reads a whole session (#464).
+const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// One line per run in `<cache>/diffctx/hook.log` (#338): Claude Code keeps
 /// only hooks that print, so without it a silent hook that decided "nothing
@@ -2428,12 +2432,11 @@ pub fn respond_within_deadline(event: Event, stdin_json: String, gate: bool) -> 
     let hook_run = crate::resource::RunContext::for_run(HOOK_DEADLINE_SECS);
     let _in_hook = hook_run.enter();
     let answer = decide(event, &stdin_json, gate, started, &mut trace);
-    log_outcome(
-        event,
-        &trace,
-        answer.as_ref().err().copied().unwrap_or("shown"),
-        started.elapsed(),
-    );
+    let outcome = match &answer {
+        Ok(_) => trace.noted.unwrap_or("shown"),
+        Err(why) => why,
+    };
+    log_outcome(event, &trace, outcome, started.elapsed());
     answer.ok()
 }
 
@@ -2453,35 +2456,10 @@ mod tests {
         Trigger::Inspect { staged, own: None }
     }
 
-    /// A commit with no staging on its line: `-a` or the index.
-    fn commit(all: bool, amend: bool) -> Trigger {
-        Trigger::Commit {
-            amend,
-            staging: if all { Staging::All } else { Staging::Index },
-            steps: Vec::new(),
-        }
-    }
-
-    fn only(paths: &[&str]) -> Trigger {
-        Trigger::Commit {
-            amend: false,
-            staging: Staging::Only(paths.iter().map(|p| p.to_string()).collect()),
-            steps: Vec::new(),
-        }
-    }
-
-    fn after_adds(adds: &[&[&str]]) -> Trigger {
-        Trigger::Commit {
-            amend: false,
-            staging: Staging::Index,
-            steps: adds
-                .iter()
-                .map(|a| Replay {
-                    dir: None,
-                    args: a.iter().map(|w| w.to_string()).collect(),
-                })
-                .collect(),
-        }
+    /// A commit the gate can review from the index (`plain`), or one that
+    /// stages on its own line, names paths or takes `-a`.
+    fn commit(plain: bool, amend: bool) -> Trigger {
+        Trigger::Commit { amend, plain }
     }
 
     #[test]
@@ -2492,67 +2470,48 @@ mod tests {
             "git commit -m x &> log.txt",
             "git commit -m x 2> err.txt; git log -1",
         ] {
-            assert_eq!(pre(command), Some(commit(false, false)), "{command}");
+            assert_eq!(pre(command), Some(commit(true, false)), "{command}");
         }
         assert_eq!(
             pre("git commit -m x src/a.py 2>&1"),
-            Some(only(&["src/a.py"]))
+            Some(commit(false, false))
         );
     }
 
     #[test]
     fn verbs_and_their_escapes() {
-        assert_eq!(pre("git commit -m 'x'"), Some(commit(false, false)));
-        assert_eq!(pre("git commit -am x"), Some(commit(true, false)));
-        assert_eq!(pre("git commit --all -m x"), Some(commit(true, false)));
+        assert_eq!(pre("git commit -m 'x'"), Some(commit(true, false)));
+        assert_eq!(pre("git commit -am x"), Some(commit(false, false)));
+        assert_eq!(pre("git commit --all -m x"), Some(commit(false, false)));
         assert_eq!(
             pre("git commit -m x -- src/a.py"),
-            Some(only(&["src/a.py"]))
+            Some(commit(false, false))
+        );
+        assert_eq!(
+            pre("git commit --pathspec-from-file=list.txt -m x"),
+            Some(commit(false, false))
         );
         assert_eq!(
             detect(Event::PreToolUse, "cd repo && git -C /tmp/r commit -am x").unwrap(),
             Detected {
-                trigger: commit(true, false),
+                trigger: commit(false, false),
                 dir: Some("/tmp/r".to_string())
             }
         );
         assert_eq!(
             pre("git commit -q --amend --no-edit"),
-            Some(commit(false, true))
+            Some(commit(true, true))
         );
         assert!(pre("git commit --dry-run").is_none());
-        assert_eq!(
-            pre("git merge feature/x"),
-            Some(Trigger::Merge("feature/x".to_string()))
-        );
-        assert!(pre("git merge --abort").is_none());
-        assert_eq!(
-            pre("git cherry-pick abc123"),
-            Some(Trigger::CherryPick(vec!["abc123".to_string()]))
-        );
-        assert_eq!(
-            pre("git cherry-pick -x -m 1 a b c"),
-            Some(Trigger::CherryPick(vec![
-                "a".to_string(),
-                "b".to_string(),
-                "c".to_string()
-            ]))
-        );
-        assert_eq!(
-            pre("git merge -m 'merge it' -X theirs feature/x"),
-            Some(Trigger::Merge("feature/x".to_string()))
-        );
-        assert!(pre("git cherry-pick --continue").is_none());
-        assert_eq!(
-            pre("git push origin main"),
-            Some(Trigger::Push(Pushed::Ref {
-                remote: "origin".to_string(),
-                src: "main".to_string(),
-                dst: None
-            }))
-        );
-        assert!(pre("git push --tags").is_none());
-        assert!(pre("git push --dry-run").is_none());
+        // Merges, picks and pushes are read off git's record once they ran,
+        // never predicted from the line.
+        for line in [
+            "git merge feature/x",
+            "git cherry-pick abc123",
+            "git push origin main",
+        ] {
+            assert!(pre(line).is_none(), "{line}");
+        }
         assert_eq!(
             pre("gh pr create --fill"),
             Some(Trigger::PullRequest {
@@ -2562,50 +2521,30 @@ mod tests {
         );
         assert!(pre("gh pr view 12").is_none());
         assert!(pre("git status && git log").is_none());
-        // The add has not run when the hook sees the line: it is replayed
-        // on a copy of the index before the commit is reviewed.
+        // A line that stages before it commits is not a plain commit.
+        for line in [
+            "git add -A && git commit -m x && git push",
+            "git add a.py && git rm -r old && git commit -m x",
+            "git mv a b && git commit -m x",
+            "git add -p && git commit -m x",
+        ] {
+            assert_eq!(pre(line), Some(commit(false, false)), "{line}");
+        }
+        assert_eq!(pre("git commit -qam x"), Some(commit(false, false)));
+        assert_eq!(pre("git commit -S -m x"), Some(commit(true, false)));
+        assert_eq!(pre("git commit -m x -i a.py"), Some(commit(false, false)));
+        assert_eq!(pre("git commit -m a -m b"), Some(commit(true, false)));
+        assert_eq!(pre("git commit -F msg.txt"), Some(commit(true, false)));
+        // An escaped quote inside the message is the message (#436): the
+        // gate reviews the index, never lets it through unread.
         assert_eq!(
-            pre("git add -A && git commit -m x && git push"),
-            Some(after_adds(&[&["add", "-A"]]))
+            pre(r#"git commit -m "vat \"incl\" tax""#),
+            Some(commit(true, false))
         );
-        assert_eq!(
-            pre("git add a.py && git rm -r old && git commit -m x"),
-            Some(after_adds(&[
-                &["add", "a.py"],
-                &["rm", "--cached", "-q", "-r", "old"]
-            ]))
-        );
-        assert!(matches!(
-            pre("git mv a b && git commit -m x"),
-            Some(Trigger::Commit {
-                staging: Staging::Worktree,
-                ..
-            })
-        ));
-        assert!(matches!(
-            pre("git add -p && git commit -m x"),
-            Some(Trigger::Commit {
-                staging: Staging::Worktree,
-                ..
-            })
-        ));
-        assert_eq!(pre("git commit -qam x"), Some(commit(true, false)));
-        assert_eq!(pre("git commit -S -m x"), Some(commit(false, false)));
-        assert_eq!(
-            pre("git commit -m x -i a.py"),
-            Some(Trigger::Commit {
-                amend: false,
-                staging: Staging::Include(vec!["a.py".to_string()]),
-                steps: Vec::new(),
-            })
-        );
-        assert_eq!(pre("git commit -m a -m b"), Some(commit(false, false)));
-        assert_eq!(pre("git commit -F msg.txt"), Some(commit(false, false)));
-        assert_eq!(pre("git commit -m x src/a.py"), Some(only(&["src/a.py"])));
         assert_eq!(
             detect(Event::PreToolUse, "cd sub/app && git commit -m x").unwrap(),
             Detected {
-                trigger: commit(false, false),
+                trigger: commit(true, false),
                 dir: Some("sub/app".to_string())
             }
         );
@@ -2627,6 +2566,21 @@ mod tests {
             Some(format!("{}/x", home.trim_end_matches('/')))
         );
         assert!(pre("git -C \"$REPO\" commit -m x").is_none());
+        // A variable the line sets to a literal directory is that directory
+        // (#422); one set from the shell's output is not guessed at.
+        for line in [
+            "L=/abs/wt; cd $L && git commit -m x",
+            "export L=/abs/wt && cd \"${L}\" && git commit -m x",
+            "L=/abs; git -C $L/wt commit -m x",
+        ] {
+            assert_eq!(
+                detect(Event::PreToolUse, line).unwrap().dir,
+                Some("/abs/wt".to_string()),
+                "{line}"
+            );
+        }
+        assert!(pre("L=$(pwd); cd $L && git commit -m x").is_none());
+        assert!(pre("L=/a; cd $LX && git commit -m x").is_none());
         assert!(pre("cd $R && cd sub && git commit -m x").is_none());
         assert_eq!(
             detect(Event::PreToolUse, "cd $R && cd /abs && git commit -m x")
@@ -2647,11 +2601,8 @@ mod tests {
         assert_eq!(post("git diff HEAD"), Some(inspection(false)));
         assert_eq!(post("git diff -- src/"), Some(inspection(false)));
         assert_eq!(post("git diff src/a.py"), Some(inspection(false)));
-        let committed = Some(Trigger::Committed {
-            amend: false,
-            onto: None,
-        });
-        assert_eq!(post("git commit -m x"), committed);
+        // What a commit recorded is read off the reflog, not detected.
+        assert!(post("git commit -m x").is_none());
         assert!(pre("git diff").is_none());
         // A status beside a diff only summarises it: the diff decides.
         for line in [
@@ -2660,14 +2611,17 @@ mod tests {
         ] {
             assert_eq!(post(line), Some(inspection(true)), "{line}");
         }
-        assert_eq!(post("git status && git commit -m x"), committed);
+        assert_eq!(
+            post("git status && git commit -m x"),
+            Some(inspection(false))
+        );
     }
 
     #[test]
     fn the_first_statement_wins_and_operators_end_it() {
         assert_eq!(
             pre("git add -A; git commit -m 'a; b' | cat"),
-            Some(after_adds(&[&["add", "-A"]]))
+            Some(commit(false, false))
         );
         assert!(pre("git log | grep commit").is_none());
     }
@@ -2713,17 +2667,17 @@ mod tests {
     fn a_heredoc_body_is_text_and_a_newline_ends_the_statement() {
         assert_eq!(
             pre("git commit -q -F - <<'EOF'\nfix: don't x; y | z\n\nbody `a` & b\nEOF"),
-            Some(commit(false, false))
+            Some(commit(true, false))
         );
         assert_eq!(
             pre("git commit -F- <<-\"EOF\" 2>&1 | tail -1\n\tmsg a.py\n\tEOF\ngit push"),
-            Some(commit(false, false))
+            Some(commit(true, false))
         );
         assert_eq!(
             pre("git add a.py\ngit commit -m x"),
-            Some(after_adds(&[&["add", "a.py"]]))
+            Some(commit(false, false))
         );
-        assert_eq!(pre("git commit \\\n  -m x"), Some(commit(false, false)));
+        assert_eq!(pre("git commit \\\n  -m x"), Some(commit(true, false)));
         assert_eq!(pre("cat <<< 'git commit -m x'"), None);
     }
 

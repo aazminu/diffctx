@@ -73,9 +73,10 @@ struct Cli {
     #[arg(short = 'f', long, default_value = "yaml", value_enum)]
     format: OutputFormat,
 
-    /// Git diff range (e.g. HEAD~1..HEAD, main..feature), a duration window
-    /// ending now (24h, 8d, 90min, 1h30m), or `staged` (also `--diff=--cached`)
-    /// for the index alone; omitted or bare --diff uses the working tree vs HEAD
+    /// Git diff range (e.g. HEAD~1..HEAD, main..feature; A..B is what B changed
+    /// since it forked from A), a duration window ending now (24h, 8d, 90min,
+    /// 1h30m), or `staged` (also `--diff=--cached`) for the index alone;
+    /// omitted or bare --diff uses the working tree vs HEAD
     #[arg(long = "diff", num_args = 0..=1, default_missing_value = "HEAD")]
     diff_ref: Option<String>,
 
@@ -135,16 +136,19 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum HookEvent {
-    /// Claude Code PreToolUse: before a git commit, merge, cherry-pick, push
-    /// or a PR is created, print the change's impact as additionalContext
+    /// Claude Code PreToolUse: record the refs a git commit, merge,
+    /// cherry-pick, revert or push may move; before a PR is created, print
+    /// its impact as additionalContext
     Pretooluse {
-        /// Strict gate: deny the command with the impact attached until the
-        /// change has been reviewed once (then the retry passes)
+        /// Strict gate: deny a plain git commit with the index's impact
+        /// attached until it has been reviewed once (then the retry passes);
+        /// a commit line that stages for itself is asked to stage first
         #[arg(long)]
         gate: bool,
     },
-    /// Claude Code PostToolUse: after a git diff or git status, the pending
-    /// change's impact; after a search for a name the change edits, its callers
+    /// Claude Code PostToolUse: after a commit, merge, pick, revert or push,
+    /// the impact of what it recorded; after a git diff or git status, the
+    /// pending change's; after a search for a name the change edits, its callers
     Posttooluse,
 }
 
@@ -401,6 +405,11 @@ fn empty_diff_hint(
         _ if is_duration_window(root, diff_ref) => {
             format!("nothing changed in the last {diff_ref}; widen the window (e.g. --diff 7d)")
         }
+        // `A..B` is read from the fork point, which is git's `A...B`.
+        _ if diff_ref.contains("..") && !diff_ref.contains("...") => format!(
+            "check the range with: git diff --stat {}",
+            diff_ref.replacen("..", "...", 1)
+        ),
         _ => format!("check the range with: git diff --stat {diff_ref}"),
     }
 }
@@ -477,14 +486,15 @@ fn run_impact(
     if let Some(range) = diff_ref.as_deref() {
         _diffctx::hook::mark_range_reviewed(&cli.path, range, &output);
     }
-    emit_impact(cli, &output)
+    emit_impact(cli, output)
 }
 
-fn emit_impact(cli: &Cli, output: &_diffctx::impact::ImpactOutput) -> Result<()> {
-    let rendered = match cli.format {
-        OutputFormat::Md => _diffctx::impact::render_markdown(output),
-        _ => format!("{}\n", serde_json::to_string(output)?),
-    };
+fn emit_impact(cli: &Cli, mut output: _diffctx::impact::ImpactOutput) -> Result<()> {
+    let markdown = matches!(cli.format, OutputFormat::Md);
+    let mut rendered = _diffctx::impact::deliver(&mut output, markdown, resolve_budget(cli.budget));
+    if !markdown {
+        rendered.push('\n');
+    }
     // An empty impact is the answer, not a failure: the hook keys on it.
     if !cli.quiet {
         print_token_summary(&rendered);
@@ -565,7 +575,7 @@ fn real_main() -> Result<()> {
                 timeout,
             )
         })?;
-        return emit_impact(&cli, &output);
+        return emit_impact(&cli, output);
     }
     if cli.mode == "impact" {
         return run_impact(&cli, path, diff_ref, alpha, scoring_mode, timeout);

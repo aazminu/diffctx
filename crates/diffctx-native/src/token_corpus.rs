@@ -56,7 +56,9 @@ impl TokenCorpus {
         let store = TokenCacheStore::open(min_len);
         let oids = if store.is_some() {
             match ctx.source.list_blobs(&[]) {
-                Some(blobs) => blobs.into_iter().map(|b| (b.path, b.oid)).collect(),
+                Some(Ok(blobs)) => blobs.into_iter().map(|b| (b.path, b.oid)).collect(),
+                // The working tree's ids would key another state's tokens.
+                Some(Err(_)) => FxHashMap::default(),
                 None => resolve_cacheable_oids(&ctx.root_dir),
             }
         } else {

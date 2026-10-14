@@ -16,14 +16,17 @@ context stops paying for itself, under a hard token budget.
   call on its own during a review. `mode="impact"` answers in under 2k tokens
   what a change reaches outside its own diff.
 - `/diffctx:commit [message]` — the impact first, then the commit.
-- Hooks that hand Claude the pending change's impact — callers outside the
-  diff, whether a test guards each, symbols several commits touched — before
-  `git commit`, `merge`, `cherry-pick`, `push` and `gh pr create`, and after
-  a `git diff` or `git status` Claude ran itself. Once per change (a manual
-  `--mode impact` run counts), silent when nothing outside the diff depends
-  on it, never blocking. `impact_hook` turns them off; `impact_gate` (off by
-  default) denies a commit until its impact was shown once, so the retry
-  passes.
+- Hooks that hand Claude a change's impact — callers outside the diff,
+  whether a test guards each, symbols several commits touched — once a
+  `git commit`, `merge`, `cherry-pick`, `revert` or `push` has run (what git
+  recorded, read off its reflog), before `gh pr create`, and after a
+  `git diff` or `git status` Claude ran itself. Once per change (a manual
+  `--mode impact` run counts; a commit of a change already shown gets a
+  one-line pointer), one line when nothing outside the diff depends on it,
+  never blocking. `impact_hook` turns them off; `impact_gate` (off by
+  default) denies a plain `git commit` until the impact of the index it
+  records was shown once, so the retry passes, and asks a commit line that
+  stages for itself to stage first.
 
 ## What it runs
 

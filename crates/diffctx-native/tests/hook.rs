@@ -147,16 +147,65 @@ fn output_of(h: &Hook, event: &str) -> serde_json::Value {
 }
 
 fn context_of(h: &Hook) -> String {
-    output_of(h, "PreToolUse")["additionalContext"]
+    let doc: serde_json::Value = serde_json::from_str(h.stdout.trim())
+        .unwrap_or_else(|_| panic!("no hook JSON: {:?}", h.stdout));
+    doc["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap()
         .to_string()
 }
 
-fn payload_in_session(session: &str, repo: &Path, command: &str) -> String {
-    let mut doc: serde_json::Value = serde_json::from_str(&payload(repo, command)).unwrap();
+fn in_session(session: &str, payload: &str) -> String {
+    let mut doc: serde_json::Value = serde_json::from_str(payload).unwrap();
     doc["session_id"] = serde_json::Value::String(session.to_string());
     doc.to_string()
+}
+
+fn payload_in_session(session: &str, repo: &Path, command: &str) -> String {
+    in_session(session, &payload(repo, command))
+}
+
+/// `command` as the Bash tool runs it: through `sh`, in `cwd`. A line that
+/// fails is still a line the agent ran.
+fn sh(cwd: &Path, env: &[(&str, &Path)], command: &str) {
+    Command::new("sh")
+        .current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .envs(env.iter().copied())
+        .args(["-c", command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run sh");
+}
+
+/// One line as the agent runs it in `session`: its `PreToolUse`, which
+/// only records the refs, the line itself, then the `PostToolUse` whose
+/// answer is returned.
+fn line_in(session: &str, cwd: &Path, cache: &Path, env: &[(&str, &Path)], command: &str) -> Hook {
+    let pre = hook_in_env(
+        cwd,
+        cache,
+        "pretooluse",
+        &[],
+        env,
+        &payload_in_session(session, cwd, command),
+    );
+    assert_eq!(
+        (pre.code, pre.stdout.as_str()),
+        (Some(0), ""),
+        "{command}: a recording line is answered once it ran"
+    );
+    sh(cwd, env, command);
+    let after = in_session(session, &payload_for("PostToolUse", cwd, command));
+    hook_in_env(cwd, cache, "posttooluse", &[], env, &after)
+}
+
+fn run_line(repo: &Path, cache: &Path, command: &str) -> Hook {
+    line_in("s1", repo, cache, &[], command)
 }
 
 #[test]
@@ -166,28 +215,20 @@ fn a_change_one_session_was_shown_is_news_to_the_next() {
     let tmp = repo_with_pending_change();
     let repo = tmp.path();
     let cache = TempDir::new().unwrap();
-    let first = hook(
-        repo,
-        cache.path(),
-        &payload_in_session("one", repo, "git commit -am vat"),
+    let inspect_in = |session: &str| {
+        let diff = in_session(session, &payload_for("PostToolUse", repo, "git diff"));
+        hook_with(repo, cache.path(), "posttooluse", &[], &diff)
+    };
+    assert!(answered(&inspect_in("one")));
+    assert_eq!(
+        inspect_in("one").stdout,
+        "",
+        "the same session is not told twice"
     );
-    assert!(context_of(&first).contains("shop/checkout.py::charge"));
-    let again = hook(
-        repo,
-        cache.path(),
-        &payload_in_session("one", repo, "git commit -am vat"),
-    );
-    assert_eq!(again.stdout, "", "the same session is not told twice");
-    let other = hook(
-        repo,
-        cache.path(),
-        &payload_in_session("two", repo, "git commit -am vat"),
-    );
-    assert!(
-        context_of(&other).contains("shop/checkout.py::charge"),
-        "{}",
-        other.stdout
-    );
+    let other = line_in("two", repo, cache.path(), &[], "git commit -am vat");
+    let context = context_of(&other);
+    assert!(context.contains("shop/checkout.py::charge"), "{context}");
+    assert!(!context.contains("shown earlier"), "{context}");
 }
 
 #[test]
@@ -202,24 +243,21 @@ fn a_manual_impact_run_just_before_still_counts() {
         .output()
         .expect("run diffctx");
     assert!(manual.status.success());
-    let h = hook(
-        repo,
-        cache.path(),
-        &payload_in_session("fresh", repo, "git commit -am vat"),
-    );
+    let h = line_in("fresh", repo, cache.path(), &[], "git commit -am vat");
     assert_reminder(&h);
 }
 
-/// A commit of a change whose impact the agent already read: one line that
-/// names what was shown, never the listing again and never silence (#346).
+/// A line that recorded a change whose impact the agent already read: one
+/// line that names what was shown, never the listing again and never
+/// silence (#346, #501).
 fn assert_reminder(h: &Hook) {
     assert_eq!(h.code, Some(0));
-    let context = output_of(h, "PreToolUse")["additionalContext"]
+    let context = output_of(h, "PostToolUse")["additionalContext"]
         .as_str()
         .unwrap()
         .to_string();
     assert!(
-        context.starts_with("diffctx: this command records a change whose impact was"),
+        context.starts_with("diffctx: this command recorded a change whose impact was"),
         "{context}"
     );
     assert!(
@@ -235,9 +273,13 @@ fn a_commit_with_an_outside_caller_gets_the_impact_once() {
     let tmp = repo_with_pending_change();
     let cache = TempDir::new().unwrap();
     let repo = tmp.path();
-    let first = hook(repo, cache.path(), &payload(repo, "git commit -am 'vat'"));
+    let first = run_line(repo, cache.path(), "git commit -am 'vat'");
     assert_eq!(first.code, Some(0));
     let context = context_of(&first);
+    assert!(
+        context.starts_with("diffctx reviewed what this commit recorded."),
+        "{context}"
+    );
     assert!(context.contains("shop/checkout.py::charge"), "{context}");
     assert!(
         context.contains("reachable from tests: tests/test_checkout.py"),
@@ -245,31 +287,29 @@ fn a_commit_with_an_outside_caller_gets_the_impact_once() {
     );
     assert!(context.contains("Check these callers"), "{context}");
     assert!(context.chars().count() <= 9_200, "{}", context.len());
-    let out = output_of(&first, "PreToolUse");
+    let out = output_of(&first, "PostToolUse");
     assert!(
         out.get("permissionDecision").is_none(),
         "no gate by default"
     );
 
-    let again = hook(repo, cache.path(), &payload(repo, "git commit -am 'vat'"));
+    let again = run_line(repo, cache.path(), "git commit -am 'vat'");
     assert_eq!(again.code, Some(0));
-    assert_eq!(again.stdout, "", "the same content is reviewed once");
+    assert_eq!(again.stdout, "", "a line that records nothing says nothing");
 }
 
 /// #405: a subshell's parentheses are words of their own, and its `cd`
-/// ends with it: `(cd shop && git add pricing.py)` stages
-/// `shop/pricing.py`, not a path named `pricing.py)`.
+/// ends with it.
 #[test]
-fn a_subshell_add_before_a_commit_is_replayed() {
+fn a_subshell_add_before_a_commit_is_reviewed() {
     let tmp = repo_with_pending_change();
     let cache = TempDir::new().unwrap();
     let repo = tmp.path();
-    let h = hook(
+    let h = run_line(
         repo,
         cache.path(),
-        &payload(repo, "(cd shop && git add pricing.py) && git commit -m vat"),
+        "(cd shop && git add pricing.py) && git commit -m vat",
     );
-    assert_eq!(h.code, Some(0));
     let context = context_of(&h);
     assert!(context.contains("shop/checkout.py::charge"), "{context}");
 }
@@ -279,11 +319,10 @@ fn a_subshell_add_before_a_commit_is_replayed() {
 /// not say; an odd `"` inside `-m "$(cat <<'EOF' … EOF)"` closes nothing.
 #[test]
 fn comments_subshell_cds_cd_dash_and_heredoc_messages_keep_their_commit() {
-    let tmp = repo_with_pending_change();
-    let repo = tmp.path();
     let answered = |command: &str| {
+        let tmp = repo_with_pending_change();
         let cache = TempDir::new().unwrap();
-        let h = hook(repo, cache.path(), &payload(repo, command));
+        let h = run_line(tmp.path(), cache.path(), command);
         assert_eq!(h.code, Some(0));
         context_of(&h)
     };
@@ -292,9 +331,16 @@ fn comments_subshell_cds_cd_dash_and_heredoc_messages_keep_their_commit() {
         commented.contains("shop/checkout.py::charge"),
         "{commented}"
     );
-    let message =
-        answered("git commit -am \"$(cat <<'EOF'\nSupport 5\" screens (and more)\nEOF\n)\"");
-    assert!(message.contains("shop/checkout.py::charge"), "{message}");
+    let tmp = repo_with_pending_change();
+    let repo = tmp.path();
+    // Recorded, not read as git hidden in a substitution. Not run: bash 3.2,
+    // macOS's `sh`, cannot parse this line itself.
+    let cache = TempDir::new().unwrap();
+    let message = "git commit -am \"$(cat <<'EOF'\nSupport 5\" screens (and more)\nEOF\n)\"";
+    let h = hook(repo, cache.path(), &payload(repo, message));
+    assert_eq!(h.stdout, "");
+    let line = last_log_line(cache.path());
+    assert!(line.contains(" recorded "), "{line}");
 
     let cache = TempDir::new().unwrap();
     let h = hook(
@@ -302,7 +348,11 @@ fn comments_subshell_cds_cd_dash_and_heredoc_messages_keep_their_commit() {
         cache.path(),
         &payload(repo, "cd - && git commit -am vat"),
     );
-    assert_eq!(h.stdout, "", "cd - names no directory");
+    assert!(
+        h.stdout.contains("did not analyse this command"),
+        "cd - names no directory, and says so: {}",
+        h.stdout
+    );
 
     let other = repo_with_pending_change();
     write(
@@ -313,8 +363,7 @@ fn comments_subshell_cds_cd_dash_and_heredoc_messages_keep_their_commit() {
     let cache = TempDir::new().unwrap();
     // Quoted as a shell carries it: a Windows path's backslashes are not escapes.
     let command = format!("(cd '{}' && git commit -am x)", other.path().display());
-    let h = hook(repo, cache.path(), &payload(repo, &command));
-    let context = context_of(&h);
+    let context = context_of(&run_line(repo, cache.path(), &command));
     assert!(context.contains("shop/shelf.py::refill"), "{context}");
 }
 
@@ -325,14 +374,8 @@ fn a_plain_commit_reviews_the_index_not_the_working_tree() {
     let repo = tmp.path();
     // pricing is staged; inventory is edited but NOT staged.
     git(repo, &["add", "shop/pricing.py"]);
-    write(
-        repo,
-        "shop/inventory.py",
-        "def restock(item):\n    return item.count + 10\n",
-    );
-    let h = hook(repo, cache.path(), &payload(repo, "git commit -m 'vat'"));
-    assert_eq!(h.code, Some(0));
-    let context = context_of(&h);
+    add_unrelated_edit(repo);
+    let context = context_of(&run_line(repo, cache.path(), "git commit -m 'vat'"));
     assert!(context.contains("shop/checkout.py::charge"), "{context}");
     assert!(
         !context.contains("shop/shelf.py"),
@@ -340,9 +383,7 @@ fn a_plain_commit_reviews_the_index_not_the_working_tree() {
     );
 
     // `-a` takes the working tree, and the inventory caller with it.
-    let cache2 = TempDir::new().unwrap();
-    let h = hook(repo, cache2.path(), &payload(repo, "git commit -am 'vat'"));
-    let context = context_of(&h);
+    let context = context_of(&run_line(repo, cache.path(), "git commit -am 'restock'"));
     assert!(context.contains("shop/shelf.py::refill"), "{context}");
 }
 
@@ -359,13 +400,8 @@ fn a_manual_impact_run_counts_as_the_review() {
         .status()
         .unwrap();
     assert!(status.success());
-    let h = hook(repo, cache.path(), &payload(repo, "git commit -am 'vat'"));
+    let h = run_line(repo, cache.path(), "git commit -am 'vat'");
     assert_reminder(&h);
-    let again = hook(repo, cache.path(), &payload(repo, "git commit -am 'vat'"));
-    assert_eq!(
-        again.stdout, "",
-        "a second commit attempt of the same change"
-    );
 }
 
 /// #454: a commit of code this build reads as text is not silence — the
@@ -383,7 +419,7 @@ fn a_commit_of_unparsed_code_says_it_was_not_analysed() {
         "num/solver.f90",
         "module solver\ncontains\n  subroutine step(x)\n    real :: x\n  end subroutine step\nend module solver\n",
     );
-    let h = hook(repo, cache.path(), &payload(repo, "git commit -am solver"));
+    let h = run_line(repo, cache.path(), "git commit -am solver");
     assert_eq!(h.code, Some(0));
     let context = context_of(&h);
     assert!(context.contains("1 not analysed"), "{context}");
@@ -393,16 +429,29 @@ fn a_commit_of_unparsed_code_says_it_was_not_analysed() {
     );
 }
 
+/// #464: an empty answer is one line, so that no block means the hook did
+/// not run, never "reviewed, nothing".
 #[test]
-fn a_change_nothing_depends_on_is_silence() {
+fn a_change_nothing_depends_on_says_so_in_one_line() {
     let tmp = repo_with_pending_change();
     let cache = TempDir::new().unwrap();
     let repo = tmp.path();
     git(repo, &["checkout", "-q", "--", "shop/pricing.py"]);
     write(repo, "README.md", "# shop\n\nVAT included.\n");
-    let h = hook(repo, cache.path(), &payload(repo, "git commit -am docs"));
+    let h = run_line(
+        repo,
+        cache.path(),
+        "git add README.md && git commit -qm docs",
+    );
     assert_eq!(h.code, Some(0));
-    assert_eq!(h.stdout, "");
+    let context = context_of(&h);
+    assert!(
+        context.contains("reaches nothing outside the diff"),
+        "{context}"
+    );
+    assert_eq!(context.lines().count(), 1, "{context}");
+    assert!(!h.stdout.contains("permissionDecision"), "{}", h.stdout);
+    assert!(last_log_line(cache.path()).contains(" empty "));
 }
 
 #[test]
@@ -418,14 +467,16 @@ fn a_push_names_the_range_since_upstream() {
     );
     git(repo, &["push", "-q", "-u", "origin", "HEAD"]);
     commit_all(repo, "vat");
-    let h = hook(repo, cache.path(), &payload(repo, "git push"));
+    let h = run_line(repo, cache.path(), "git push");
     assert_eq!(h.code, Some(0));
     let context = context_of(&h);
     assert!(context.contains("shop/checkout.py::charge"), "{context}");
 }
 
+/// A branch the remote does not have yet sends what it holds past the
+/// remote's default branch.
 #[test]
-fn a_push_without_an_upstream_falls_back_to_origin_main() {
+fn a_push_of_a_new_branch_is_measured_from_the_remote_default() {
     let tmp = repo_with_pending_change();
     let cache = TempDir::new().unwrap();
     let repo = tmp.path();
@@ -437,8 +488,9 @@ fn a_push_without_an_upstream_falls_back_to_origin_main() {
     );
     git(repo, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
     // No tracking branch, and no origin/HEAD after a plain `remote add`.
+    git(repo, &["checkout", "-q", "-b", "topic"]);
     commit_all(repo, "vat");
-    let h = hook(repo, cache.path(), &payload(repo, "git push origin HEAD"));
+    let h = run_line(repo, cache.path(), "git push origin HEAD");
     assert_eq!(h.code, Some(0));
     let context = context_of(&h);
     assert!(context.contains("shop/checkout.py::charge"), "{context}");
@@ -450,7 +502,7 @@ fn a_push_with_no_remote_at_all_is_silence() {
     let cache = TempDir::new().unwrap();
     let repo = tmp.path();
     commit_all(repo, "vat");
-    let h = hook(repo, cache.path(), &payload(repo, "git push origin main"));
+    let h = run_line(repo, cache.path(), "git push origin main");
     assert_eq!(h.code, Some(0));
     assert_eq!(h.stdout, "");
 }
@@ -505,46 +557,76 @@ fn repo_with_branches_beside_origin() -> (TempDir, TempDir) {
     (tmp, remote)
 }
 
-/// #416: a push reviews the ref it names. From `main`, `git push origin
+/// #416: a push reviews the ref it moved. From `main`, `git push origin
 /// feature` reviewed `main`'s own unpushed commit, or logged "clean" once
 /// `main` had none, and never the feature commit it sends.
 #[test]
 fn a_push_reviews_the_ref_it_names_not_the_current_branch() {
+    // A branch `origin` does not have yet, and one it has, forced.
+    for command in [
+        "git push origin feature",
+        "git push -u origin +feature:main",
+    ] {
+        let (tmp, _remote) = repo_with_branches_beside_origin();
+        let cache = TempDir::new().unwrap();
+        let context = context_of(&run_line(tmp.path(), cache.path(), command));
+        assert!(
+            context.contains("shop/checkout.py::charge"),
+            "{command}: {context}"
+        );
+        assert!(
+            !context.contains("shop/invoice.py"),
+            "{command}: main's own commit is not what it sends: {context}"
+        );
+    }
+    // Pushed again, a branch sends only what it gained since.
     let (tmp, _remote) = repo_with_branches_beside_origin();
     let repo = tmp.path();
-    let sends_feature = |command: &str| {
+    git(repo, &["push", "-q", "origin", "feature"]);
+    git(repo, &["checkout", "-q", "feature"]);
+    write(
+        repo,
+        "shop/inventory.py",
+        "def restock(item):\n    return item.count + 3\n",
+    );
+    commit_all(repo, "restock on feature");
+    git(repo, &["checkout", "-q", "main"]);
+    let cache = TempDir::new().unwrap();
+    let context = context_of(&run_line(repo, cache.path(), "git push origin feature"));
+    assert!(context.contains("shop/shelf.py::refill"), "{context}");
+    assert!(!context.contains("shop/checkout.py::charge"), "{context}");
+}
+
+/// One push of several refs reviews the first it moved and counts the
+/// rest, never the current branch in their place (#416).
+#[test]
+fn a_push_of_several_refs_reviews_one_and_counts_the_rest() {
+    for command in ["git push origin feature main", "git push --all origin"] {
+        let (tmp, _remote) = repo_with_branches_beside_origin();
         let cache = TempDir::new().unwrap();
-        let h = hook(repo, cache.path(), &payload(repo, command));
+        let context = context_of(&run_line(tmp.path(), cache.path(), command));
         assert!(
-            h.stdout.contains("shop/checkout.py::charge"),
-            "{command}: {}",
-            last_log_line(cache.path())
+            context.contains("1 other pushed ref(s) are not analysed"),
+            "{command}: {context}"
         );
         assert!(
-            !h.stdout.contains("shop/invoice.py"),
-            "{command}: main's own commit is not what it sends: {}",
-            h.stdout
+            context.contains("shop/checkout.py::charge"),
+            "{command}: {context}"
         );
-    };
-    // A branch `origin` does not have yet, and one it has.
-    sends_feature("git push origin feature");
-    sends_feature("git push -u origin +feature:main");
-    git(repo, &["push", "-q", "origin", "main"]);
-    sends_feature("git push origin feature");
+    }
 }
 
 #[test]
 fn a_push_that_only_deletes_is_silence() {
-    let (tmp, _remote) = repo_with_branches_beside_origin();
-    let repo = tmp.path();
     for command in [
         "git push origin :old",
         "git push origin +:old",
         "git push origin --delete old",
         "git push -fd origin old",
     ] {
+        let (tmp, _remote) = repo_with_branches_beside_origin();
         let cache = TempDir::new().unwrap();
-        let h = hook(repo, cache.path(), &payload(repo, command));
+        let h = run_line(tmp.path(), cache.path(), command);
         assert_eq!(h.code, Some(0), "{command}");
         assert_eq!(h.stdout, "", "{command}: {}", last_log_line(cache.path()));
     }
@@ -578,28 +660,32 @@ fn a_pull_request_reviews_the_branches_it_names() {
     assert!(!context.contains("shop/invoice.py"), "{context}");
 }
 
-/// #416: a ref only the shell can name, several at once, or one the
-/// repository does not have is logged unresolved, never reviewed as the
-/// current branch.
+/// #416: a ref only the shell can name, or one the repository does not
+/// have, moves nothing and is answered with nothing, never with the current
+/// branch; a PR base nothing resolves is logged unresolved.
 #[test]
 fn a_ref_the_line_does_not_resolve_is_logged_not_replaced() {
     let (tmp, _remote) = repo_with_branches_beside_origin();
     let repo = tmp.path();
     for command in [
         "git push origin \"$BRANCH\"",
-        "git push origin feature main",
-        "git push --all origin",
         "git push origin nope",
         "git push origin feature:",
-        "gh pr create --base nope --fill",
     ] {
         let cache = TempDir::new().unwrap();
-        let h = hook(repo, cache.path(), &payload(repo, command));
+        let h = run_line(repo, cache.path(), command);
         assert_eq!(h.code, Some(0), "{command}");
         assert_eq!(h.stdout, "", "{command}");
-        let line = last_log_line(cache.path());
-        assert!(line.contains(" unresolved-ref "), "{command}: {line}");
     }
+    let cache = TempDir::new().unwrap();
+    let h = hook(
+        repo,
+        cache.path(),
+        &payload(repo, "gh pr create --base nope --fill"),
+    );
+    assert_eq!(h.stdout, "");
+    let line = last_log_line(cache.path());
+    assert!(line.contains(" unresolved-ref "), "{line}");
 }
 
 /// One command line's `PreToolUse` and `PostToolUse` in `session`, with what
@@ -607,10 +693,8 @@ fn a_ref_the_line_does_not_resolve_is_logged_not_replaced() {
 fn hook_pair(session: &str, repo: &Path, cache: &Path, command: &str, runs: impl FnOnce()) -> Hook {
     hook(repo, cache, &payload_in_session(session, repo, command));
     runs();
-    let mut after: serde_json::Value =
-        serde_json::from_str(&payload_for("PostToolUse", repo, command)).unwrap();
-    after["session_id"] = serde_json::Value::String(session.to_string());
-    hook_with(repo, cache, "posttooluse", &[], &after.to_string())
+    let after = in_session(session, &payload_for("PostToolUse", repo, command));
+    hook_with(repo, cache, "posttooluse", &[], &after)
 }
 
 /// #406: after a `git commit` that landed nothing, a commit another session
@@ -640,37 +724,34 @@ fn a_commit_that_landed_nothing_is_not_answered_with_another_sessions_commit() {
     assert_eq!(h.stdout, "", "{}", last_log_line(cache.path()));
 }
 
-/// An amend replaces `HEAD` on its parent: what it lands is still the
-/// line's own commit, measured from that parent as its preview was.
+/// An amend replaces `HEAD` on its parent: what it records is measured from
+/// that parent, the earlier commit's change included, whatever staged it.
 #[test]
-fn an_amend_that_lands_other_content_than_previewed_is_checked() {
-    let tmp = repo_with_pending_change();
-    let cache = TempDir::new().unwrap();
-    let repo = tmp.path();
-    commit_all(repo, "vat");
-    add_unrelated_edit(repo);
-    let h = hook_pair(
-        "b",
-        repo,
-        cache.path(),
-        "git commit -qa --amend --no-edit",
-        || {
-            write(
-                repo,
-                "shop/inventory.py",
-                "def restock(item):\n    return item.count + 20\n",
-            );
-            git(repo, &["commit", "-qa", "--amend", "--no-edit"]);
-        },
-    );
-    let line = last_log_line(cache.path());
-    assert!(h.stdout.contains("commit that just landed"), "{line}");
-    assert!(
-        h.stdout.contains("shop/checkout.py::charge"),
-        "{}",
-        h.stdout
-    );
-    assert!(h.stdout.contains("shop/shelf.py::refill"), "{}", h.stdout);
+fn an_amend_is_reviewed_onto_the_parent() {
+    for (command, takes_inventory) in [
+        (
+            "git add docs/NOTES.md && git commit -q --amend --no-edit",
+            false,
+        ),
+        ("git commit -qa --amend --no-edit", true),
+    ] {
+        let tmp = repo_with_pending_change();
+        let cache = TempDir::new().unwrap();
+        let repo = tmp.path();
+        commit_all(repo, "vat");
+        write(repo, "docs/NOTES.md", "fixup\n");
+        add_unrelated_edit(repo);
+        let context = context_of(&run_line(repo, cache.path(), command));
+        assert!(
+            context.contains("shop/checkout.py::charge"),
+            "{command}: {context}"
+        );
+        assert_eq!(
+            context.contains("shop/shelf.py::refill"),
+            takes_inventory,
+            "{command}: {context}"
+        );
+    }
 }
 
 /// A Claude Code transcript at `dir/b.jsonl` whose session edited `edited`;
@@ -765,69 +846,76 @@ fn an_inspection_reviews_only_what_this_session_edited() {
     }
 }
 
+/// A merge reviews what it brings in, not our own commits; `--squash`
+/// records nothing, and the commit that follows it is what is reviewed.
 #[test]
 fn a_merge_reviews_the_branch_not_our_own_commits() {
-    let tmp = repo_with_pending_change();
+    let diverged = || {
+        let tmp = repo_with_pending_change();
+        let repo = tmp.path();
+        git(repo, &["checkout", "-q", "-b", "topic"]);
+        commit_all(repo, "vat on topic");
+        git(repo, &["checkout", "-q", "-"]);
+        // Diverge: main edits inventory, which topic never touched.
+        add_unrelated_edit(repo);
+        commit_all(repo, "restock more");
+        tmp
+    };
+    let tmp = diverged();
     let cache = TempDir::new().unwrap();
-    let repo = tmp.path();
-    git(repo, &["checkout", "-q", "-b", "topic"]);
-    commit_all(repo, "vat on topic");
-    git(repo, &["checkout", "-q", "-"]);
-    // Diverge: main edits inventory, which topic never touched.
-    write(
-        repo,
-        "shop/inventory.py",
-        "def restock(item):\n    return item.count + 10\n",
-    );
-    commit_all(repo, "restock more");
-    let h = hook(repo, cache.path(), &payload(repo, "git merge topic"));
-    assert_eq!(h.code, Some(0));
-    let context = context_of(&h);
+    let context = context_of(&run_line(tmp.path(), cache.path(), "git merge topic"));
     assert!(context.contains("shop/checkout.py::charge"), "{context}");
     assert!(
         !context.contains("shop/shelf.py"),
         "our own inventory commit is not what the merge brings in: {context}"
     );
-}
 
-#[test]
-fn a_cherry_pick_reviews_the_picked_commit() {
-    let tmp = repo_with_pending_change();
-    let cache = TempDir::new().unwrap();
+    let tmp = diverged();
     let repo = tmp.path();
-    git(repo, &["checkout", "-q", "-b", "topic"]);
-    commit_all(repo, "vat on topic");
-    git(repo, &["checkout", "-q", "-"]);
-    let h = hook(repo, cache.path(), &payload(repo, "git cherry-pick topic"));
-    assert_eq!(h.code, Some(0));
-    let context = context_of(&h);
+    let cache = TempDir::new().unwrap();
+    let squash = run_line(repo, cache.path(), "git merge --squash topic");
+    assert_eq!(squash.stdout, "", "{}", last_log_line(cache.path()));
+    let context = context_of(&run_line(repo, cache.path(), "git commit -m squashed"));
     assert!(context.contains("shop/checkout.py::charge"), "{context}");
 }
 
-/// The picked commits' patch reaches `git apply` byte for byte: decoded as
-/// UTF-8 first, a Latin-1 file no longer applied and the pick went unreviewed.
+/// A pick reviews the commits it picked, all of them, a Latin-1 file among
+/// them included.
 #[test]
-fn a_pick_of_several_commits_with_a_latin1_file_is_reviewed() {
-    let tmp = repo_with_pending_change();
-    let cache = TempDir::new().unwrap();
-    let repo = tmp.path();
-    git(repo, &["stash", "-q"]);
-    std::fs::write(repo.join("shop/names.py"), b"NAME = '\xe9t\xe9'\n").unwrap();
-    commit_all(repo, "names");
-    git(repo, &["checkout", "-q", "-b", "topic"]);
-    std::fs::write(repo.join("shop/names.py"), b"NAME = '\xe9t\xe9 2'\n").unwrap();
-    commit_all(repo, "names on topic");
-    git(repo, &["stash", "pop", "-q"]);
-    commit_all(repo, "vat on topic");
-    git(repo, &["checkout", "-q", "-"]);
-    let h = hook(
-        repo,
-        cache.path(),
-        &payload(repo, "git cherry-pick topic~1 topic"),
-    );
-    assert_eq!(h.code, Some(0));
-    let context = context_of(&h);
-    assert!(context.contains("shop/checkout.py::charge"), "{context}");
+fn a_cherry_pick_reviews_the_picked_commits() {
+    let topic = || {
+        let tmp = repo_with_pending_change();
+        let repo = tmp.path();
+        git(repo, &["stash", "-q"]);
+        std::fs::write(repo.join("shop/names.py"), b"NAME = '\xe9t\xe9'\n").unwrap();
+        commit_all(repo, "names");
+        git(repo, &["checkout", "-q", "-b", "topic"]);
+        std::fs::write(repo.join("shop/names.py"), b"NAME = '\xe9t\xe9 2'\n").unwrap();
+        commit_all(repo, "names on topic");
+        git(repo, &["stash", "pop", "-q"]);
+        commit_all(repo, "vat on topic");
+        add_unrelated_edit(repo);
+        commit_all(repo, "restock on topic");
+        git(repo, &["checkout", "-q", "-"]);
+        tmp
+    };
+    for (command, takes_restock) in [
+        ("git cherry-pick topic~1", false),
+        ("git cherry-pick -x topic~2 topic~1 topic", true),
+    ] {
+        let tmp = topic();
+        let cache = TempDir::new().unwrap();
+        let context = context_of(&run_line(tmp.path(), cache.path(), command));
+        assert!(
+            context.contains("shop/checkout.py::charge"),
+            "{command}: {context}"
+        );
+        assert_eq!(
+            context.contains("shop/shelf.py::refill"),
+            takes_restock,
+            "{command}: {context}"
+        );
+    }
 }
 
 #[test]
@@ -849,13 +937,12 @@ fn a_git_diff_the_agent_ran_gets_the_impact_after_it() {
     assert!(out.get("permissionDecision").is_none());
 
     // The commit that follows is the same content: a reminder, not a repeat.
-    let again = hook(repo, cache.path(), &payload(repo, "git commit -am vat"));
+    let again = run_line(repo, cache.path(), "git commit -am vat");
     assert_reminder(&again);
 
     // A historical diff is not the pending change — with a real HEAD~1 and
     // a fresh pending edit, so the silence comes from the verb, not from an
     // unresolvable revision.
-    commit_all(repo, "vat");
     write(
         repo,
         "shop/pricing.py",
@@ -915,28 +1002,8 @@ fn one_change_through_status_diff_add_and_commit_is_shown_once() {
         );
         assert_eq!(again.stdout, "", "{command} repeated the same answer");
     }
-    let commit = hook(repo, cache.path(), &payload(repo, "git commit -m vat"));
+    let commit = run_line(repo, cache.path(), "git commit -m vat");
     assert_reminder(&commit);
-}
-
-#[test]
-fn an_amend_reviews_the_index_onto_the_parent() {
-    let tmp = repo_with_pending_change();
-    let cache = TempDir::new().unwrap();
-    let repo = tmp.path();
-    commit_all(repo, "vat");
-    write(repo, "docs/NOTES.md", "fixup\n");
-    git(repo, &["add", "docs/NOTES.md"]);
-    let h = hook(
-        repo,
-        cache.path(),
-        &payload(repo, "git commit -q --amend --no-edit"),
-    );
-    assert!(
-        h.stdout.contains("shop/checkout.py::charge"),
-        "{}",
-        h.stdout
-    );
 }
 
 #[test]
@@ -944,49 +1011,64 @@ fn the_strict_gate_denies_once_with_the_impact_attached() {
     let tmp = repo_with_pending_change();
     let cache = TempDir::new().unwrap();
     let repo = tmp.path();
-    let first = hook_with(
-        repo,
-        cache.path(),
-        "pretooluse",
-        &["--gate"],
-        &payload(repo, "git commit -am vat"),
-    );
-    assert_eq!(first.code, Some(0));
-    let out = output_of(&first, "PreToolUse");
+    let gated = |cache: &Path, command: &str| {
+        hook_with(
+            repo,
+            cache,
+            "pretooluse",
+            &["--gate"],
+            &payload(repo, command),
+        )
+    };
+    // A line that stages for itself is asked to stage first: the gate never
+    // predicts what a command will stage (#508).
+    for command in [
+        "git commit -am vat",
+        "git add -A && git commit -m vat",
+        "git commit -m vat -- shop/pricing.py",
+        "git commit --pathspec-from-file=paths.txt -m vat",
+    ] {
+        let out = output_of(&gated(cache.path(), command), "PreToolUse");
+        assert_eq!(out["permissionDecision"], "deny", "{command}");
+        let reason = out["permissionDecisionReason"].as_str().unwrap();
+        assert!(reason.contains("as its own command"), "{command}: {reason}");
+        assert!(!reason.contains("again to proceed"), "{command}: {reason}");
+    }
+    git(repo, &["add", "-A"]);
+    let out = output_of(&gated(cache.path(), "git commit -m vat"), "PreToolUse");
     assert_eq!(out["permissionDecision"], "deny");
-    assert!(
-        out["additionalContext"]
-            .as_str()
-            .unwrap()
-            .contains("shop/checkout.py::charge")
-    );
-    assert!(
-        out["permissionDecisionReason"]
-            .as_str()
-            .unwrap()
-            .contains("shop/checkout.py::charge")
-    );
-    let retry = hook_with(
+    for field in ["additionalContext", "permissionDecisionReason"] {
+        assert!(
+            out[field]
+                .as_str()
+                .unwrap()
+                .contains("shop/checkout.py::charge"),
+            "{field}: {out}"
+        );
+    }
+    let retry = gated(cache.path(), "git commit -m vat");
+    assert_eq!(retry.stdout, "", "reviewed once: the retry passes");
+    sh(repo, &[], "git commit -m vat");
+    let landed = hook_with(
         repo,
         cache.path(),
-        "pretooluse",
-        &["--gate"],
-        &payload(repo, "git commit -am vat"),
+        "posttooluse",
+        &[],
+        &payload_for("PostToolUse", repo, "git commit -m vat"),
     );
-    assert_eq!(retry.stdout, "", "reviewed once: the retry passes");
+    assert_reminder(&landed);
 
     // Nothing to review, nothing to gate.
     let cache2 = TempDir::new().unwrap();
-    git(repo, &["checkout", "-q", "--", "shop/pricing.py"]);
     write(repo, "README.md", "# shop\n\nVAT.\n");
-    let docs = hook_with(
-        repo,
-        cache2.path(),
-        "pretooluse",
-        &["--gate"],
-        &payload(repo, "git commit -am docs"),
+    git(repo, &["add", "README.md"]);
+    let docs = gated(cache2.path(), "git commit -m docs");
+    assert!(
+        !docs.stdout.contains("permissionDecision"),
+        "{}",
+        docs.stdout
     );
-    assert_eq!(docs.stdout, "");
+    assert!(docs.stdout.contains("reaches nothing"), "{}", docs.stdout);
 }
 
 #[test]
@@ -1024,12 +1106,24 @@ fn the_git_dash_c_directory_wins_over_cwd() {
     let repo = tmp.path();
     let elsewhere = TempDir::new().unwrap();
     let command = format!("git -C '{}' commit -am vat", repo.to_string_lossy());
-    let h = hook(
-        elsewhere.path(),
-        cache.path(),
-        &payload(elsewhere.path(), &command),
-    );
+    let h = line_in("s1", elsewhere.path(), cache.path(), &[], &command);
     assert_eq!(h.code, Some(0));
+    let context = context_of(&h);
+    assert!(context.contains("shop/checkout.py::charge"), "{context}");
+}
+
+/// #422: landing from a worktree is usually `L=/abs; cd $L && git commit …`;
+/// the variable the line itself sets names the repository.
+#[test]
+fn a_directory_the_line_sets_in_a_variable_is_followed() {
+    let tmp = repo_with_pending_change();
+    let cache = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    let command = format!(
+        "L='{}'; cd \"$L\" && git commit -qam vat",
+        tmp.path().to_string_lossy()
+    );
+    let h = line_in("s1", elsewhere.path(), cache.path(), &[], &command);
     let context = context_of(&h);
     assert!(context.contains("shop/checkout.py::charge"), "{context}");
 }
@@ -1077,12 +1171,16 @@ fn a_search_for_a_changed_name_is_answered_with_its_callers() {
     assert_eq!(search("Bash", "grep -rn restock .").stdout, "");
 
     // The search answer does not stand in for the commit's review.
-    let commit = hook(repo, cache.path(), &payload(repo, "git commit -am vat"));
+    let commit = run_line(repo, cache.path(), "git commit -am vat");
     assert!(context_of(&commit).contains("shop/checkout.py::charge"));
 
     let log = std::fs::read_to_string(cache.path().join("diffctx/hook.log")).unwrap();
     let outcomes: Vec<&str> = log.lines().map(|l| l.split(' ').nth(5).unwrap()).collect();
-    assert_eq!(outcomes, ["shown", "seen", "no-symbol", "shown"], "{log}");
+    assert_eq!(
+        outcomes,
+        ["shown", "seen", "no-symbol", "recorded", "shown"],
+        "{log}"
+    );
     let last = log.lines().last().unwrap();
     assert!(
         last.contains(" commit ") && last.contains(" shown "),
@@ -1090,7 +1188,7 @@ fn a_search_for_a_changed_name_is_answered_with_its_callers() {
     );
     assert!(
         !last.contains(" HEAD "),
-        "`-a` is planned as a tree, not read off the working tree: {log}"
+        "`-a` is read off what the commit recorded, not the working tree: {log}"
     );
 }
 
@@ -1199,7 +1297,7 @@ fn a_reminder_needs_the_same_snapshot_and_a_different_one_is_answered() {
     assert!(answered(&inspect(repo, cache.path(), "git diff")));
     // Committed: the index, which holds only pricing.py — not what was shown.
     git(repo, &["add", "shop/pricing.py"]);
-    let commit = hook(repo, cache.path(), &payload(repo, "git commit -m vat"));
+    let commit = run_line(repo, cache.path(), "git commit -m vat");
     let context = context_of(&commit);
     assert!(context.contains("shop/checkout.py::charge"), "{context}");
     assert!(!context.contains("shown earlier"), "{context}");
@@ -1288,47 +1386,6 @@ fn a_partial_answer_is_retried_a_bounded_number_of_times() {
 }
 
 #[test]
-fn a_commit_previewed_from_the_working_tree_is_checked_once_it_lands() {
-    let tmp = repo_with_pending_change();
-    let cache = TempDir::new().unwrap();
-    let repo = tmp.path();
-    let pre = hook(
-        repo,
-        cache.path(),
-        &payload(repo, "git add -A && git commit -m vat"),
-    );
-    assert!(
-        context_of(&pre).starts_with("diffctx previewed"),
-        "{}",
-        context_of(&pre)
-    );
-    git(repo, &["add", "-A"]);
-    git(repo, &["commit", "-q", "-m", "vat"]);
-    let post = inspect(repo, cache.path(), "git add -A && git commit -m vat");
-    assert_eq!(post.stdout, "", "the commit is what was previewed");
-
-    write(
-        repo,
-        "shop/pricing.py",
-        "def total(items):\n    return round(sum(i.price for i in items) * 1.5, 2)\n",
-    );
-    let pre = hook(repo, cache.path(), &payload(repo, "git commit -am more"));
-    assert!(context_of(&pre).starts_with("diffctx previewed"));
-    write(
-        repo,
-        "shop/pricing.py",
-        "def total(items):\n    return round(sum(i.price for i in items) * 1.7, 2)\n",
-    );
-    git(repo, &["commit", "-qam", "more"]);
-    let post = inspect(repo, cache.path(), "git commit -am more");
-    assert!(
-        post.stdout.contains("commit that just landed"),
-        "the commit differs from the preview: {}",
-        post.stdout
-    );
-}
-
-#[test]
 fn a_git_command_hidden_in_a_subshell_is_logged_as_unsupported() {
     let tmp = repo_with_pending_change();
     let cache = TempDir::new().unwrap();
@@ -1338,7 +1395,11 @@ fn a_git_command_hidden_in_a_subshell_is_logged_as_unsupported() {
         cache.path(),
         &payload(repo, "sh -c 'git commit -am vat'"),
     );
-    assert_eq!(h.stdout, "");
+    assert!(
+        h.stdout.contains("did not analyse this command"),
+        "{}",
+        h.stdout
+    );
     let log = std::fs::read_to_string(cache.path().join("diffctx").join("hook.log")).unwrap();
     assert!(log.contains("unsupported-syntax"), "{log}");
 }
@@ -1400,7 +1461,7 @@ fn an_add_and_commit_on_one_line_reviews_only_what_the_add_stages() {
     let repo = tmp.path();
     add_unrelated_edit(repo);
     let command = "git add shop/pricing.py && git commit -q -F - <<'EOF'\nvat: don't round twice; keep cents | all of them\n\nbody `x` & more\nEOF";
-    let h = hook(repo, cache.path(), &payload(repo, command));
+    let h = run_line(repo, cache.path(), command);
     let context = context_of(&h);
     assert!(context.contains("shop/checkout.py::charge"), "{context}");
     assert!(
@@ -1418,28 +1479,49 @@ fn a_pathspec_commit_reviews_only_its_paths() {
     let cache = TempDir::new().unwrap();
     let repo = tmp.path();
     add_unrelated_edit(repo);
-    let h = hook(
+    let context = context_of(&run_line(
         repo,
         cache.path(),
-        &payload(repo, "git commit -m vat -- shop/pricing.py"),
-    );
-    let context = context_of(&h);
+        "git commit -m vat -- shop/pricing.py",
+    ));
     assert!(context.contains("shop/checkout.py::charge"), "{context}");
     assert!(!context.contains("shop/shelf.py"), "{context}");
     assert!(!context.contains("uncommitted changes"), "{context}");
 
     // `-i` adds the paths to what is already staged.
+    let tmp = repo_with_pending_change();
+    let repo = tmp.path();
+    add_unrelated_edit(repo);
     git(repo, &["add", "shop/inventory.py"]);
-    let cache = TempDir::new().unwrap();
     write(repo, "README.md", "# shop, again\n");
-    let h = hook(
+    let cache = TempDir::new().unwrap();
+    let context = context_of(&run_line(
         repo,
         cache.path(),
-        &payload(repo, "git commit -m vat -i shop/pricing.py"),
-    );
-    let context = context_of(&h);
+        "git commit -m vat -i shop/pricing.py",
+    ));
     assert!(context.contains("shop/checkout.py::charge"), "{context}");
     assert!(context.contains("shop/shelf.py::refill"), "{context}");
+}
+
+/// #508: paths read from a file the line never shows: the planner reviewed
+/// another session's staged file with them; the commit's record holds only
+/// what it took.
+#[test]
+fn a_commit_of_paths_from_a_file_reviews_only_those_paths() {
+    let tmp = repo_with_pending_change();
+    let cache = TempDir::new().unwrap();
+    let repo = tmp.path();
+    add_unrelated_edit(repo);
+    git(repo, &["add", "shop/inventory.py"]);
+    write(repo, "paths.txt", "shop/pricing.py\n");
+    let context = context_of(&run_line(
+        repo,
+        cache.path(),
+        "git commit -q --pathspec-from-file=paths.txt -m vat",
+    ));
+    assert!(context.contains("shop/checkout.py::charge"), "{context}");
+    assert!(!context.contains("shop/shelf.py"), "{context}");
 }
 
 #[test]
@@ -1453,13 +1535,12 @@ fn a_home_relative_cd_reaches_the_repository() {
     let command = format!(
         "cd ~/{name} && FP=$(cat README.md) && git add shop/pricing.py && git commit -q -m x -- shop/pricing.py"
     );
-    let h = hook_in_env(
+    let h = line_in(
+        "s1",
         elsewhere.path(),
         cache.path(),
-        "pretooluse",
-        &[],
         &[("HOME", home)],
-        &payload(elsewhere.path(), &command),
+        &command,
     );
     let context = context_of(&h);
     assert!(context.contains("shop/checkout.py::charge"), "{context}");
@@ -1468,48 +1549,7 @@ fn a_home_relative_cd_reaches_the_repository() {
 }
 
 #[test]
-fn a_cherry_pick_of_several_commits_reviews_them_all() {
-    let tmp = repo_with_pending_change();
-    let cache = TempDir::new().unwrap();
-    let repo = tmp.path();
-    git(repo, &["checkout", "-q", "-b", "topic"]);
-    commit_all(repo, "vat on topic");
-    add_unrelated_edit(repo);
-    commit_all(repo, "restock on topic");
-    git(repo, &["checkout", "-q", "-"]);
-    let h = hook(
-        repo,
-        cache.path(),
-        &payload(repo, "git cherry-pick -x topic~1 topic"),
-    );
-    let context = context_of(&h);
-    assert!(context.contains("shop/checkout.py::charge"), "{context}");
-    assert!(context.contains("shop/shelf.py::refill"), "{context}");
-}
-
-#[test]
-fn a_staged_amend_on_one_line_reviews_onto_the_parent() {
-    let tmp = repo_with_pending_change();
-    let cache = TempDir::new().unwrap();
-    let repo = tmp.path();
-    commit_all(repo, "vat");
-    write(repo, "docs/NOTES.md", "fixup\n");
-    add_unrelated_edit(repo);
-    let h = hook(
-        repo,
-        cache.path(),
-        &payload(
-            repo,
-            "git add docs/NOTES.md && git commit -q --amend --no-edit",
-        ),
-    );
-    let context = context_of(&h);
-    assert!(context.contains("shop/checkout.py::charge"), "{context}");
-    assert!(!context.contains("shop/shelf.py"), "{context}");
-}
-
-#[test]
-fn a_commit_in_a_linked_worktree_plans_on_its_own_index() {
+fn a_commit_in_a_linked_worktree_is_read_on_its_own_branch() {
     let tmp = repo_with_pending_change();
     let cache = TempDir::new().unwrap();
     let repo = tmp.path();
@@ -1526,10 +1566,10 @@ fn a_commit_in_a_linked_worktree_plans_on_its_own_index() {
         "def total(items):\n    return round(sum(i.price for i in items) * 1.19, 2)\n",
     );
     add_unrelated_edit(&wt);
-    let h = hook(
+    let h = run_line(
         &wt,
         cache.path(),
-        &payload(&wt, "git add shop/pricing.py && git commit -m vat"),
+        "git add shop/pricing.py && git commit -m vat",
     );
     let context = context_of(&h);
     assert!(context.contains("shop/checkout.py::charge"), "{context}");
@@ -1537,114 +1577,65 @@ fn a_commit_in_a_linked_worktree_plans_on_its_own_index() {
 }
 
 #[test]
-fn the_first_commit_of_a_repository_is_planned_from_the_empty_tree() {
+fn the_first_commit_of_a_repository_is_read_from_the_empty_tree() {
     let tmp = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     let repo = tmp.path();
     git(repo, &["init", "-q", "."]);
+    git(repo, &["config", "user.email", "test@example.com"]);
+    git(repo, &["config", "user.name", "diffctx tests"]);
     write(repo, "a.py", "def f():\n    return 1\n");
-    let h = hook(
-        repo,
-        cache.path(),
-        &payload(repo, "git add -A && git commit -qm init"),
-    );
+    let h = run_line(repo, cache.path(), "git add -A && git commit -qm init");
     assert_eq!(h.code, Some(0));
     let line = last_log_line(cache.path());
     assert!(
-        !line.contains("no-range") && !line.contains("error"),
+        line.contains(" commit ") && line.contains(" empty "),
         "{line}"
+    );
+    assert!(
+        h.stdout.contains("reaches nothing outside the diff"),
+        "{}",
+        h.stdout
     );
 }
 
+/// Whatever stages the change — a patch, a loop, `xargs`, an option git
+/// takes before its verb, a message with escaped quotes (#436) — the commit's
+/// record is what is reviewed, and only what it took (#508).
 #[test]
-fn an_empty_answer_stays_empty_after_the_commit_lands() {
-    let tmp = repo_with_pending_change();
-    let cache = TempDir::new().unwrap();
-    let repo = tmp.path();
-    git(repo, &["checkout", "-q", "--", "shop/pricing.py"]);
-    write(repo, "README.md", "# shop\n\nmore\n");
-    let command = "git add README.md && git commit -qm readme";
-    let pre = hook(repo, cache.path(), &payload(repo, command));
-    assert_eq!(pre.stdout, "");
-    git(repo, &["add", "README.md"]);
-    git(repo, &["commit", "-qm", "readme"]);
-    inspect(repo, cache.path(), command);
-    let line = last_log_line(cache.path());
-    assert!(line.contains(" empty "), "{line}");
-}
-
-#[test]
-fn merge_and_pick_switches_leave_their_target_alone() {
-    let tmp = repo_with_pending_change();
-    let repo = tmp.path();
-    git(repo, &["checkout", "-q", "-b", "topic"]);
-    commit_all(repo, "vat on topic");
-    git(repo, &["checkout", "-q", "-"]);
+fn staging_by_any_means_is_read_off_the_commit() {
     for command in [
-        "git merge --squash topic",
-        "git merge -S topic",
-        "git cherry-pick -S topic",
+        "git apply --cached vat.patch && git commit -m vat",
+        "for f in shop/pricing.py; do git add \"$f\"; done && git commit -m vat",
+        "echo shop/pricing.py | xargs git add && git commit -m vat",
+        "git --git-dir .git --work-tree . add shop/pricing.py && git --git-dir .git commit -m vat",
+        "git add shop/pricing.py && git commit -m \"vat \\\"incl\\\" tax\"",
     ] {
+        let tmp = repo_with_pending_change();
+        let repo = tmp.path();
+        let diff = Command::new("git")
+            .current_dir(repo)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .args(["diff"])
+            .output()
+            .unwrap();
+        std::fs::write(repo.join("vat.patch"), diff.stdout).unwrap();
+        add_unrelated_edit(repo);
         let cache = TempDir::new().unwrap();
-        let h = hook(repo, cache.path(), &payload(repo, command));
+        let h = run_line(repo, cache.path(), command);
         assert!(
             h.stdout.contains("shop/checkout.py::charge"),
             "{command}: {}",
             last_log_line(cache.path())
         );
+        assert!(
+            !h.stdout.contains("shop/shelf.py"),
+            "{command}: {}",
+            h.stdout
+        );
     }
-}
-
-#[test]
-fn a_pathspec_commit_takes_known_paths_and_never_untracked_ones() {
-    let tmp = repo_with_pending_change();
-    let repo = tmp.path();
-    write(
-        repo,
-        "shop/coupon.py",
-        "from shop.pricing import total\n\n\ndef discount(cart):\n    return total(cart.items) * 0.9\n",
-    );
-    for command in ["git commit -m vat -- shop/", "git commit -m vat -i shop/"] {
-        let cache = TempDir::new().unwrap();
-        let context = context_of(&hook(repo, cache.path(), &payload(repo, command)));
-        assert!(context.contains("1 changed file"), "{command}: {context}");
-    }
-    // Staged before the line, the new file is known to the index: `--only`
-    // takes it with the rest of its paths.
-    git(repo, &["add", "shop/coupon.py"]);
-    let cache = TempDir::new().unwrap();
-    let context = context_of(&hook(
-        repo,
-        cache.path(),
-        &payload(repo, "git commit -m vat -- shop/"),
-    ));
-    assert!(context.contains("2 changed file"), "{context}");
-}
-
-#[test]
-fn staging_the_line_does_by_other_means_previews_the_working_tree() {
-    let tmp = repo_with_pending_change();
-    let cache = TempDir::new().unwrap();
-    let repo = tmp.path();
-    let diff = Command::new("git")
-        .current_dir(repo)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .args(["diff"])
-        .output()
-        .unwrap();
-    std::fs::write(repo.join("vat.patch"), diff.stdout).unwrap();
-    let h = hook(
-        repo,
-        cache.path(),
-        &payload(repo, "git apply --cached vat.patch && git commit -m vat"),
-    );
-    assert!(
-        h.stdout.contains("shop/checkout.py::charge"),
-        "{}",
-        last_log_line(cache.path())
-    );
 }
 
 #[test]
@@ -1656,11 +1647,12 @@ fn a_step_in_another_repository_stages_nothing_here() {
     let cache = TempDir::new().unwrap();
     let repo = tmp.path();
     git(repo, &["add", "shop/pricing.py"]);
+    // Quoted as a shell carries it: a Windows path's backslashes are not escapes.
     let command = format!(
-        "git -C {} add -A && git commit -m vat",
+        "git -C '{}' add -A && git commit -m vat",
         other.path().display()
     );
-    let h = hook(repo, cache.path(), &payload(repo, &command));
+    let h = run_line(repo, cache.path(), &command);
     assert!(
         h.stdout.contains("shop/checkout.py::charge"),
         "{}",
@@ -1668,11 +1660,11 @@ fn a_step_in_another_repository_stages_nothing_here() {
     );
 }
 
-/// The preview reads a copy of the index: another process holding the
-/// index lock neither blocks it nor is disturbed by it, and the planned
-/// replay leaves no scratch file behind, even when one of its steps fails.
+/// The gate reads a copy of the index: another process holding the index
+/// lock neither blocks it nor is disturbed by it, and it leaves nothing
+/// behind.
 #[test]
-fn a_preview_never_touches_the_index_it_reads() {
+fn the_gate_never_touches_the_index_it_reads() {
     let tmp = repo_with_pending_change();
     let repo = tmp.path();
     git(repo, &["add", "shop/pricing.py"]);
@@ -1689,46 +1681,20 @@ fn a_preview_never_touches_the_index_it_reads() {
     std::fs::write(git_dir.join("index.lock"), b"").unwrap();
     let before = listing();
     let cache = TempDir::new().unwrap();
-    let h = hook(repo, cache.path(), &payload(repo, "git commit -m vat"));
+    let h = hook_with(
+        repo,
+        cache.path(),
+        "pretooluse",
+        &["--gate"],
+        &payload(repo, "git commit -m vat"),
+    );
     assert!(
         h.stdout.contains("shop/checkout.py::charge"),
         "{}",
         last_log_line(cache.path())
     );
-    std::fs::remove_file(git_dir.join("index.lock")).unwrap();
-    let before_steps = listing();
-    for command in [
-        "git add -A && git commit -m vat",
-        "git add nope.py && git commit -m vat",
-    ] {
-        let cache = TempDir::new().unwrap();
-        hook(repo, cache.path(), &payload(repo, command));
-    }
-    assert_eq!(listing(), before_steps);
-    assert!(before.contains(&"index.lock".to_string()));
+    assert_eq!(listing(), before);
     assert_eq!(std::fs::read(git_dir.join("index")).unwrap(), index);
-}
-
-#[test]
-fn the_first_commit_of_a_repository_is_checked_once_it_lands() {
-    let tmp = TempDir::new().unwrap();
-    let cache = TempDir::new().unwrap();
-    let repo = tmp.path();
-    git(repo, &["init", "-q", "."]);
-    git(repo, &["config", "user.email", "test@example.com"]);
-    git(repo, &["config", "user.name", "diffctx tests"]);
-    write(repo, "a.py", "def f():\n    return 1\n");
-    hook(
-        repo,
-        cache.path(),
-        &payload(repo, "git add -A && git commit -qm init"),
-    );
-    git(repo, &["add", "-A"]);
-    git(repo, &["commit", "-q", "-m", "init"]);
-    inspect(repo, cache.path(), "git add -A && git commit -qm init");
-    let line = last_log_line(cache.path());
-    assert!(line.contains("committed"), "{line}");
-    assert!(!line.contains(" clean "), "{line}");
 }
 
 #[test]
@@ -1746,8 +1712,13 @@ fn a_manual_run_that_found_nothing_leaves_no_reminder() {
         .status()
         .unwrap();
     assert!(status.success());
-    let h = hook(repo, cache.path(), &payload(repo, "git commit -am docs"));
-    assert_eq!(h.stdout, "");
+    let h = run_line(repo, cache.path(), "git commit -am docs");
+    assert!(
+        h.stdout.contains("reaches nothing outside the diff"),
+        "{}",
+        h.stdout
+    );
+    assert!(!h.stdout.contains("earlier"), "{}", h.stdout);
 }
 
 /// Catching up with the branch's own upstream brings in commits that
@@ -1789,13 +1760,157 @@ fn a_fast_forward_to_the_upstream_is_silence() {
     git(repo, &["checkout", "-q", &branch]);
     git(repo, &["fetch", "-q", "origin"]);
     let cache = TempDir::new().unwrap();
-    let h = hook(
+    let h = run_line(
         repo,
         cache.path(),
-        &payload(repo, &format!("git merge --ff-only origin/{branch}")),
+        &format!("git merge --ff-only origin/{branch}"),
     );
     assert_eq!(h.stdout, "", "{}", last_log_line(cache.path()));
     let cache = TempDir::new().unwrap();
-    let h = hook(repo, cache.path(), &payload(repo, "git merge topic"));
-    assert!(h.stdout.contains("shop/checkout.py::charge"));
+    let h = run_line(repo, cache.path(), "git merge topic");
+    assert!(
+        h.stdout.contains("shop/checkout.py::charge"),
+        "{}",
+        last_log_line(cache.path())
+    );
+}
+
+/// #407: a git commit inside `bash -lc "…"` or `$(git -C r commit)` is said
+/// to be unread and logged as such, not as no trigger at all.
+#[test]
+fn a_commit_inside_a_login_shell_or_substitution_is_unsupported() {
+    let tmp = repo_with_pending_change();
+    let repo = tmp.path();
+    for command in [
+        "bash -lc \"git commit -am vat\"",
+        "echo $(git -C . commit -am vat)",
+    ] {
+        let cache = TempDir::new().unwrap();
+        let h = hook(repo, cache.path(), &payload(repo, command));
+        assert!(
+            h.stdout.contains("did not analyse this command"),
+            "{command}: {}",
+            h.stdout
+        );
+        assert!(
+            last_log_line(cache.path()).contains("unsupported-syntax"),
+            "{command}"
+        );
+    }
+}
+
+/// #407: a cache the hook cannot write used to disable the dedupe without a
+/// word, so every commit reran the pipeline; the temporary directory stands
+/// in, for the dedupe and for the record a commit leaves its own answer.
+#[cfg(unix)]
+#[test]
+fn an_unwritable_cache_still_reviews_a_change_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = repo_with_pending_change();
+    let repo = tmp.path();
+    let locked = TempDir::new().unwrap();
+    std::fs::set_permissions(locked.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let scratch = TempDir::new().unwrap();
+    let env = [("TMPDIR", scratch.path())];
+    let diff = || {
+        hook_in_env(
+            repo,
+            locked.path(),
+            "posttooluse",
+            &[],
+            &env,
+            &payload_for("PostToolUse", repo, "git diff"),
+        )
+    };
+    let first = diff();
+    assert!(
+        first.stdout.contains("shop/checkout.py::charge"),
+        "{}",
+        first.stdout
+    );
+    assert_eq!(diff().stdout, "", "reviewed once");
+    let landed = line_in("s1", repo, locked.path(), &env, "git commit -am vat");
+    assert_reminder(&landed);
+    std::fs::set_permissions(locked.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// #462: `git pull --rebase && git push` on one line. The pull moves the
+/// remote-tracking ref first; what the push sent is measured from where the
+/// push found it, not from where the line did, or another session's pushed
+/// commit reads as this one's.
+#[test]
+fn a_push_after_a_pull_on_the_same_line_reviews_only_what_it_sent() {
+    let tmp = repo_with_pending_change();
+    let repo = tmp.path();
+    let remote = TempDir::new().unwrap();
+    git(remote.path(), &["init", "-q", "--bare", "."]);
+    git(
+        repo,
+        &["remote", "add", "origin", &remote.path().to_string_lossy()],
+    );
+    git(repo, &["stash", "-q"]);
+    git(repo, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    git(repo, &["fetch", "-q", "origin"]);
+    // Another session pushes a restock change.
+    let other = TempDir::new().unwrap();
+    git(
+        other.path(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "main",
+            &remote.path().to_string_lossy(),
+            ".",
+        ],
+    );
+    git(other.path(), &["config", "user.email", "test@example.com"]);
+    git(other.path(), &["config", "user.name", "diffctx tests"]);
+    add_unrelated_edit(other.path());
+    commit_all(other.path(), "restock elsewhere");
+    git(other.path(), &["push", "-q", "origin", "HEAD:main"]);
+    // This session commits its own change, then lands it.
+    git(repo, &["stash", "pop", "-q"]);
+    commit_all(repo, "vat");
+    let cache = TempDir::new().unwrap();
+    let h = run_line(
+        repo,
+        cache.path(),
+        "git pull -q --rebase origin main && git push -q origin HEAD:main",
+    );
+    let context = context_of(&h);
+    assert!(context.contains("shop/checkout.py::charge"), "{context}");
+    assert!(
+        !context.contains("shop/shelf.py"),
+        "the other session's restock was pulled, not pushed: {context}"
+    );
+}
+
+/// #448: a name defined only in an untracked file is the pending change's
+/// as much as an edited one: a search for it is answered with its callers.
+#[test]
+fn a_search_for_a_name_defined_in_an_untracked_file_is_answered() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path();
+    git(repo, &["init", "-q", "."]);
+    git(repo, &["config", "user.email", "test@example.com"]);
+    git(repo, &["config", "user.name", "diffctx tests"]);
+    write(
+        repo,
+        "main.py",
+        "from tools import convert\n\n\ndef run(x):\n    return convert(x)\n",
+    );
+    commit_all(repo, "main");
+    write(repo, "tools.py", "def convert(x):\n    return int(x)\n");
+    let cache = TempDir::new().unwrap();
+    let h = hook_with(
+        repo,
+        cache.path(),
+        "posttooluse",
+        &[],
+        &search_payload(repo, "Grep", "def convert"),
+    );
+    let context = context_of(&h);
+    assert!(context.contains("`convert`"), "{context}");
+    assert!(context.contains("main.py::run"), "{context}");
 }

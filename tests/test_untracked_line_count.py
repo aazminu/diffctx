@@ -106,11 +106,13 @@ def test_an_empty_untracked_file_produces_no_hunk_but_is_still_listed(repo_with_
 
 def test_a_binary_untracked_file_is_rejected_not_partially_counted(repo_with_untracked):
     """Invalid UTF-8 must reject the file, exactly as `read_to_string` did.
-    Counting up to the bad byte would invent a hunk length for a binary."""
+    Counting up to the bad byte would invent a hunk length for a binary. An
+    untracked binary is no source change either: listed, it inflated every
+    changed-file count with local databases nobody meant to commit (#423)."""
     repo = repo_with_untracked({"blob.dat": bytes([0, 159, 146, 150, 0, 1, 2])})
     changed = _changed_files(repo.path)
 
-    assert "blob.dat" in changed
+    assert "blob.dat" not in changed
     from diffctx._native.pipeline import build_diff_context
 
     result = build_diff_context(repo.path, "HEAD", budget_tokens=8000)

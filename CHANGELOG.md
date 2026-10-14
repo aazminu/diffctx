@@ -40,8 +40,140 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only to the definition it resolves to: a candidate suggests, it does not
   link.
 
+### Security
+
+- Impact and `--symbol` no longer name a withheld file that refers to the
+  change. 1.18.4's fix covered the changed side only: a file under
+  `.diffctx/ignore` or with a secret name that called a removed definition or
+  named a deleted path still appeared as a caller or a stale reference. The
+  withhold policy now applies inside the `git grep` readers, so every surface
+  gets only admissible files, and the files a read withheld count toward
+  `withheld_files`. The header says "N file(s) withheld by ignore rules"
+  rather than "N more", since they need not be changed files.
+
 ### Fixed
 
+- **`A..B` is what `B` changed since it forked from `A`**, in every mode and
+  at every entry point (CLI, MCP, the hook, the Action): the range resolves
+  once to the merge base and `B`'s commit. Read as two trees, a base that
+  moved on after the fork put its own later commits into the change as
+  reverts — a PR's target branch in the Action (#485), a remote-tracking
+  ref a `pull` on the same line had just moved in the hook (#462, which now
+  also measures a push from where the push itself found the ref). The
+  Action deepens a shallow checkout until the fork point is known, and says
+  so when it is not. Histories with no common commit keep git's two-tree
+  reading.
+- A range is answered from its snapshot alone. The Helm chart root was
+  probed on the disk, so a working tree without the range's `Chart.yaml`
+  dropped the chart's templates from pack and locate (#408). A snapshot
+  read that failed — out of time, cancelled, a broken stream — read as an
+  absent file and now names its limit; a snapshot listing that failed no
+  longer hands discovery or the token cache the working tree's files in its
+  place (#443).
+- The changed-file count of uncommitted work is what git would commit.
+  Untracked files are analysed as before but named apart (`untracked_files`,
+  "2 changed file(s), 1 untracked"), and an untracked binary — a local
+  database, a build artefact — is no source change at all; two `.db` files
+  and a notes file read as "5 changed file(s)" for a 2-file edit (#418,
+  #423). A search for a name defined only in an untracked file is answered
+  with its callers, as the inspection that follows already was (#448).
+- `--full A..B` listed a file the range deleted, or renamed away, as
+  changed and showed its old body read from `A`. One rule now names what a
+  range's head no longer holds, for every mode; staged pack, `--full` and
+  locate are pinned to read the index alone, renames and mode changes
+  included (#409).
+- A one-second impact run ends near its second: the loops over input-sized
+  lists (stale-reference lines, unanalysed and namer files, test edges)
+  iterate through the deadline instead of polling it by hand, and the
+  stale-reference loop, which had no poll, ran such a run to 4.5 s (now
+  1.04 s, #510). A deadline that loop hit is named in `limits`; it was read
+  before the loop ran, so a run that had dropped its stale references
+  looked complete. `DIFFCTX_TEST_DEADLINE_AFTER_POLLS=n` stops a run at its
+  `n`th poll, so tests stop it at every point without racing the clock,
+  and a corpus case its deadline stopped says so instead of failing on a
+  score (#390).
+- A call inside an f-string replacement field (`f"{fence(text)}"`) or a
+  template-literal substitution (`` `${formatBytes(n)}` ``) is a caller. The
+  hand lexer that impact and the binding resolver read code through
+  blanked every quoted byte, interpolations included, so both read
+  "0 callers" (#460, #475). Comments and string literals now come off the
+  file's grammar, interpolations kept, in every language with one; the
+  lexer and its special cases (`//` as floor division, a Rust lifetime,
+  `*` block-comment lines) are gone (#506).
+- A removed definition is one the file declared at the base and does not
+  declare at the head, both read off the grammar. Read off removed lines by
+  regex, a Rust tail expression `Err("zero")` became a removed member named
+  `Err` with every `Err(` in the crate as its callers, a bare `int(text)` in
+  a Python method a removed `int`, and a private function next to an
+  `impl` a removed API (#515, #458). A member is as public as the class or
+  interface it sits in, by nesting, not by the nearest class above it.
+- A caller of a removed definition is code that can still reach it:
+  through an import the binding model resolves to the file it left (a
+  removed member through its imported class), else from the same runtime.
+  By name alone, `subprocess.run`, another file's own `run`, a shell `die`
+  and a TypeScript `test.describe` were callers of a deleted Python script's
+  functions, and the import line was a second caller (#470, #471, #458,
+  #450). Files the range deleted resolve as files an import still names.
+- A dependency bump is a change: impact names the lock files a range
+  changes (`lockfile_changes`) and never answers "No changes to analyse" for
+  them (#495).
+- The hook's search pre-filter in the plugin script read the session's
+  cwd, not the Grep's own `path`, and ignored untracked files, so a search
+  over a pending change elsewhere never reached the binary. `bash -lc
+  "git commit …"` and `$(git -C r commit)` are named as unread rather than
+  logged as no trigger; reminders and gate denials are logged as such. A
+  cache directory the hook cannot write falls back to the temporary
+  directory instead of silently rerunning every preview (#407).
+- Before a commit or push the hook says what it did when it has no impact
+  to show: one line when the change reaches nothing outside the diff, and
+  one when it could not read the command (a git inside a subshell, a `cd`
+  it cannot resolve), with the command to run instead. Silence then means
+  the hook did not run, not a clean review; the hook log keeps tens of
+  thousands of runs so an audit reads a whole session (#464).
+- The MCP tool timed out at 300 s on a monorepo range the CLI answered in
+  four seconds (#457), for two reasons. It widened a subdirectory
+  `repo_path` to the whole repository; it now analyses the directory asked
+  about, as the CLI does with the same path. And impact grepped every
+  removed name as a fixed string in every file, so a deleted `call` matched
+  each `callback` in the repository's data and the run never stopped
+  (#413): the grep now reads whole words in code files only, at most 20
+  lines a file, and a name on more than 500 lines is answered "too common to
+  trace by name" instead of listed.
+- Impact is fitted to its cap on the text the reader receives: markdown was
+  shed against the size of its JSON, so a 148-token answer cited a
+  2000-token cap and lost its contract block; an omitted count printed
+  under the previous list's heading (#451). `--budget` (CLI) and
+  `budget_tokens` (MCP) set the cap, which stayed 2000 whatever was asked,
+  and a shed answer says which flag lists the rest (#466).
+- The MCP tool's refusal of `symbol` together with `diff_ref` or
+  `fragment_ids` names the call that answers: drop them and ask in
+  `mode="impact"`, which looks the name up in the working tree (#499).
+- Impact no longer reads "not examined" as "nothing there". A failed `git
+  grep` or file listing marks the run partial (`read_failed`) instead of
+  dropping the removed definition's callers and the stale references with
+  exit 0; a failed snapshot listing no longer falls back to the working
+  tree. A changed code file over the size cap or unreadable is named in
+  `unanalysed_files` (it answered `"empty": true` while pack said
+  `file_too_large`). Limits follow pack's rule, so the contribution and
+  total-byte caps, which drop callers, are named; the per-node edge cap
+  every repository trips still is not. A caller whose edge that cap cut
+  faces the same tests an edge would have and stays a caller (`--symbol`
+  answered "0 callers" for a function its route handler calls). A
+  definition changed only in comments, formatting or position is listed
+  in `layout_only` and the answer says its callers were not traced, where
+  it said "No resolved static callers"; the hook's search answer says the
+  same instead of claiming none. Under a limit, "nothing calls them" reads
+  "no caller found in this partial run". Unparsed files that name a
+  camelCase definition are disclosed: identifiers are stored lowercased,
+  and the lookup compared them as written.
+- Impact no longer calls a definition whose only callers are inside the diff
+  one that "nothing calls": a helper extracted from a function the same
+  commit changes read as dead code, on 62–75% of that list across three
+  ranges of this repository. Such definitions are listed under "Changed,
+  called only from inside the diff, no static test link" and in the new
+  `untested_called_in_diff` field; an in-diff source counts when it passes
+  the tests any caller passes. 1.18.3 never printed the clause, so 1.18.4
+  added the false statement (#441).
 - A control statement removed from a method body is no removed member:
   `match (a, b) {` in a Rust `impl` read as a removed API `match`, and
   every file spelling the keyword became its caller. `when`, `try`,
@@ -106,6 +238,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Plugin hook: a commit, merge, cherry-pick, revert or push is reviewed
+  from what git recorded, once the line ran** — read off the reflog (`HEAD`'s
+  last entry, a remote-tracking ref's "update by push"), never predicted
+  from the command text. The prediction took fifteen parser commits in
+  nine days and still reviewed another session's staged file for
+  `git commit --pathspec-from-file` instead of the paths the commit took
+  (#508). A loop, `xargs`, `git apply --cached`, `git --git-dir … commit` or
+  an escaped quote now stage what they stage, and the review says what the
+  commit took (#405, #436). A commit of a change already shown gets a
+  one-line pointer instead of silence (#501); a push of several refs
+  reviews the first and counts the rest; a `--squash` merge is reviewed by
+  the commit that records it. `L=/abs; cd $L && git commit` follows the
+  variable the line sets (#422). The opt-in strict gate still reviews
+  before git runs, and only what needs no prediction: the index a plain
+  `git commit` records; a commit line that stages for itself is denied with
+  the instruction to stage as its own command. Without the gate the impact
+  now arrives with the commit's result, which is when Claude Code delivered
+  the old preview too (#429).
 - Claude plugin: the MCP server and the hooks launch `uvx diffctx[mcp]==X`
   with no other option, and `plugin/uv.lock` pins the release's whole
   dependency tree with PyPI hashes, the shape the plugin directory reads as a

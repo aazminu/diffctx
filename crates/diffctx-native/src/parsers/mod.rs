@@ -27,7 +27,7 @@ static STRATEGIES: Lazy<Vec<Box<dyn FragmentationStrategy>>> = Lazy::new(|| {
 
 pub(crate) use tree_sitter_strategy::{has_grammar, parse_tree};
 
-pub use tree_sitter_strategy::ParseOutcome;
+pub use tree_sitter_strategy::{Declaration, ParseOutcome, code_only, declarations};
 
 /// Why a code file's definitions were not all read (#454): `no_grammar` when
 /// this build has no grammar for its language, `parse_timeout` when the
@@ -62,6 +62,8 @@ pub fn unanalysed_text(reason: &str) -> &'static str {
         "no_grammar" => "no grammar in this build",
         "parse_timeout" => "parse timed out",
         "parse_partial" => "parsed with errors",
+        "too_large" => "over the size cap",
+        "unreadable" => "could not be read",
         _ => "parse failed",
     }
 }

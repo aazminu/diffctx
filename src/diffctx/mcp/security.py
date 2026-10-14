@@ -67,6 +67,17 @@ def validate_repo_path(repo_path: str) -> Path:
     return repo_root
 
 
+def validate_scope(repo_path: str) -> Path:
+    """The directory asked about, once its repository passes `validate_repo_path`.
+
+    A subdirectory is the scope the CLI reads from the same path; widening it
+    to the repository root analysed a whole monorepo range for a request about
+    one project (#457).
+    """
+    validate_repo_path(repo_path)
+    return Path(repo_path).resolve()
+
+
 def validate_dir_path(dir_path: str) -> Path:
     path = Path(dir_path).resolve()
     _check_allowed(path, dir_path)

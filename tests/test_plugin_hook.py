@@ -69,19 +69,43 @@ def _context(stdout: str) -> str:
     return json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
 
 
-def test_a_commit_hears_its_callers_once(tmp_path, pending_change):
-    first = _hook(tmp_path, ["pretooluse"], _event(pending_change, "PreToolUse", "git commit -am vat"))
-    assert first.returncode == 0, first.stderr
-    assert "shop/checkout.py::charge" in _context(first.stdout)
+def _run(repo: Path, command: str) -> None:
+    """The line itself, as the Bash tool runs it, under a git config of its own."""
+    env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "diffctx tests",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "diffctx tests",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    }
+    subprocess.run(["sh", "-c", command], cwd=repo, env=env, capture_output=True, check=False, timeout=60)
 
-    again = _hook(tmp_path, ["pretooluse"], _event(pending_change, "PreToolUse", "git commit -am vat"))
-    assert again.returncode == 0
-    assert again.stdout == ""
+
+def _commit(tmp_path: Path, repo: Path) -> subprocess.CompletedProcess[str]:
+    before = _hook(tmp_path, ["pretooluse"], _event(repo, "PreToolUse", "git commit -am vat"))
+    assert before.returncode == 0, before.stderr
+    assert before.stdout == "", "a commit is answered from what it recorded"
+    _run(repo, "git commit -am vat")
+    after = _hook(tmp_path, ["posttooluse"], _event(repo, "PostToolUse", "git commit -am vat"))
+    assert after.returncode == 0, after.stderr
+    return after
+
+
+def test_a_commit_hears_its_callers_once_it_landed(tmp_path, pending_change):
+    assert "shop/checkout.py::charge" in _context(_commit(tmp_path, pending_change).stdout)
+    assert _commit(tmp_path, pending_change).stdout == "", "the same line again recorded nothing"
 
 
 def test_the_gate_denies_once_with_the_impact_in_the_reason(tmp_path, pending_change):
-    denied = _hook(tmp_path, ["pretooluse", "--gate"], _event(pending_change, "PreToolUse", "git commit -am vat"))
-    assert denied.returncode == 0, denied.stderr
+    staging = _hook(tmp_path, ["pretooluse", "--gate"], _event(pending_change, "PreToolUse", "git commit -am vat"))
+    assert staging.returncode == 0, staging.stderr
+    answer = json.loads(staging.stdout)["hookSpecificOutput"]
+    assert answer["permissionDecision"] == "deny"
+    assert "as its own command" in answer["permissionDecisionReason"]
+    _run(pending_change, "git add -A")
+    denied = _hook(tmp_path, ["pretooluse", "--gate"], _event(pending_change, "PreToolUse", "git commit -m vat"))
     answer = json.loads(denied.stdout)["hookSpecificOutput"]
     assert answer["permissionDecision"] == "deny"
     assert "shop/checkout.py::charge" in answer["permissionDecisionReason"]
@@ -129,12 +153,20 @@ def _script(tmp_path: Path, bash: str, gate: bool, event: str) -> subprocess.Com
 @pytest.mark.skipif(sys.platform == "win32", reason="the plugin scripts are exercised under POSIX bash")
 @pytest.mark.parametrize("bash", _bashes())
 @pytest.mark.parametrize("gate", [False, True])
-def test_the_plugin_script_reaches_the_hook_on_an_add_and_commit_line(tmp_path, pending_change, bash, gate):
-    result = _script(tmp_path, bash, gate, _event(pending_change, "PreToolUse", "git add -A && git commit -m vat"))
-    assert result.returncode == 0, result.stderr
-    answer = json.loads(result.stdout)["hookSpecificOutput"]
-    text = answer["permissionDecisionReason"] if gate else answer["additionalContext"]
-    assert "shop/checkout.py::charge" in text
+def test_the_plugin_script_reaches_the_hook_around_an_add_and_commit_line(tmp_path, pending_change, bash, gate):
+    line = "git add -A && git commit -m vat"
+    before = _script(tmp_path, bash, gate, _event(pending_change, "PreToolUse", line))
+    assert before.returncode == 0, before.stderr
+    if gate:
+        answer = json.loads(before.stdout)["hookSpecificOutput"]
+        assert answer["permissionDecision"] == "deny"
+        assert "as its own command" in answer["permissionDecisionReason"]
+        return
+    assert before.stdout == ""
+    _run(pending_change, line)
+    after = _script(tmp_path, bash, gate, _event(pending_change, "PostToolUse", line))
+    assert after.returncode == 0, after.stderr
+    assert "shop/checkout.py::charge" in _context(after.stdout)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the plugin scripts are exercised under POSIX bash")
@@ -247,11 +279,15 @@ def test_the_plugin_script_launches_on_a_search_only_over_a_pending_change(tmp_p
     printed = json.loads(_search(pending_change, "Bash", 'grep -rn "def total" .', session="s4"))
     printed["tool_response"] = {"stdout": "./deploy.sh:3:  cd /srv/app && make\n"}
     assert "shop/checkout.py::charge" in _context(run(json.dumps(printed)))
+    # A Grep searches its own path, wherever the session's cwd is (#407).
+    elsewhere = json.loads(_search(pending_change, "Grep", "total", session="s5"))
+    elsewhere["cwd"] = str(tmp_path)
+    assert "shop/checkout.py::charge" in _context(run(json.dumps(elsewhere)))
     assert run(_search(pending_change, "Bash", "ls | grep total")) == ""
-    assert calls.read_text().count("\n") == 4
+    assert calls.read_text().count("\n") == 5
     subprocess.run(["git", "checkout", "-q", "--", "."], cwd=pending_change, check=True)
     assert run(_search(pending_change, "Bash", "grep -rn total .")) == ""
-    assert calls.read_text().count("\n") == 4, "a clean tree launches nothing"
+    assert calls.read_text().count("\n") == 5, "a clean tree launches nothing"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the plugin scripts are exercised under POSIX bash")

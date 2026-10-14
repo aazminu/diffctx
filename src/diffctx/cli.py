@@ -601,7 +601,8 @@ def _build_main_parser(prog: str = "diffctx", version: str = __version__) -> arg
         default=None,
         metavar="RANGE",
         help=(
-            "Git diff range (e.g., HEAD~1..HEAD, main..feature) or a duration window ending now "
+            "Git diff range (e.g., HEAD~1..HEAD, main..feature; A..B is what B changed since it "
+            "forked from A) or a duration window ending now "
             "(24h, 8d, 90min, 1h30m, 2w — units s/m/h/d/w), which covers the commits inside the "
             "window plus the uncommitted work on top. 'staged' (or --diff=--cached) analyses the "
             "index alone, captured once. Bare --diff shows uncommitted changes (working tree vs HEAD)."

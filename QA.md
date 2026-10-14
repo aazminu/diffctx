@@ -40,7 +40,12 @@ verbatim. `STUMBLE_URL` is the Pages landing page.
   public-facing host). Enumerate both arms every pass —
   `GET /repos/nikolay-e/diffctx/issues?type=issues&state=open`. Triage on
   Forgejo, then cross-link to the GitHub issue that carries the work item
-  and its gate, rather than duplicating the tracker.
+  and its gate, rather than duplicating the tracker: the Forgejo copy closes
+  with that link and what was read live, and a report with no GitHub twin
+  gets one first ("Reported on Forgejo #N, carried here as the work item").
+  Most of these reports come from the owner's own sessions on private
+  repos, which sit on this machine: reproduce on the named repo read-only
+  before calling one unreproducible, and keep repo names out of GitHub.
 - The `redact-check` PreToolUse hook blocks a tracker post whose **command
   line** mentions a deny-listed secret name — including the Keychain
   service name used to fetch the API token. Fetch the token in a separate
@@ -274,6 +279,22 @@ truncated at the 2k cap (`truncated`), files the consumer repo's own
 were real: a spread call read as a member access, and a silent zero for
 withheld callers. A failing corpus case gets the same question first:
 is the case right?
+
+A missed caller has three causes that read alike, and two probes split
+them. `RUST_LOG=diffctx=debug,_diffctx=debug` prints, per changed symbol,
+`impact <path>::<name>: kept N, dropped {reason: count}`: no such line means
+the graph holds no reverse edge at all (a builder gap); a `not_forward` or
+`binding_rejected` count names the filter that dropped it. Re-running with
+`DIFFCTX_MAX_EDGES_PER_NODE=100000` tells the per-node edge cap from both: a
+caller that appears only then was cut by the cap, which the answer does not
+report (#446). Copying the two files into a scratch repo is the third
+probe: found there and missed in the real tree means scale, not syntax.
+
+The diff review's file list is checked by arithmetic, not by eye:
+`changed_files` + `changed_files_omitted` + `deleted_files` + `withheld_files`
+against `git diff --name-only <range> | wc -l`. Impact drops lock files
+from every count (#495), so a gap equal to the changed lock files is that,
+and any other gap is a dropped file.
 
 ## Bug channels (enumerated 2026-08-05)
 

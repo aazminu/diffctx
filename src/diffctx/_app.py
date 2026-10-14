@@ -128,7 +128,11 @@ def _empty_diff_hint(args: ParsedArgs) -> str:
         return "check the staged changes with: git diff --cached --stat"
     if _is_duration_range(args):
         return f"nothing changed in the last {args.diff_range}; widen the window (e.g. --diff 7d)"
-    return f"check the range with: git diff --stat {args.diff_range}"
+    # `A..B` is read from the fork point, which is git's `A...B`.
+    shown = args.diff_range
+    if shown and ".." in shown and "..." not in shown:
+        shown = shown.replace("..", "...", 1)
+    return f"check the range with: git diff --stat {shown}"
 
 
 def _working_tree_is_dirty(root_dir: Path) -> bool:
@@ -586,6 +590,7 @@ def _run_impact_mode(args: ParsedArgs, prog: str) -> None:
                 paths=_diff_scope(args),
                 markdown=args.output_format == "md",
                 symbol=args.symbol,
+                budget=args.budget,
             ),
             args.timeout,
             prog,

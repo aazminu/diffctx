@@ -320,21 +320,13 @@ fn tree_endpoint(repo_root: &Path, range: &str) -> Option<StagedSnapshot> {
 /// analyse, and falling back to the working tree would answer a different
 /// question, so it is an error naming the cause.
 pub fn capture_staged(repo_root: &Path) -> Result<StagedSnapshot> {
-    capture_planned(repo_root, PlanStart::Index, &[]).map_err(|e| match e {
+    capture_planned(repo_root, &[]).map_err(|e| match e {
         GitError::CommandFailed(reason) => GitError::CommandFailed(format!(
             "cannot analyse the staged changes: the index cannot be written as a tree \
              (unmerged entries? resolve them and stage the result) — {reason}"
         )),
         e => e,
     })
-}
-
-/// Where a staging plan starts: the index as it stands, or `HEAD` with
-/// commits applied on top (`git cherry-pick`).
-#[derive(Clone, Copy)]
-pub enum PlanStart<'a> {
-    Index,
-    Picked(&'a [String]),
 }
 
 /// One `git add`/`git rm` of a command line, run in its own directory.
@@ -346,11 +338,7 @@ pub type PlanStep = (PathBuf, Vec<String>);
 /// it), the line's staging commands replayed against the copy, then
 /// `write-tree`. The steps run git itself, so pathspecs, ignores and clean
 /// filters resolve as they will when the line runs.
-pub fn capture_planned(
-    repo_root: &Path,
-    start: PlanStart,
-    steps: &[PlanStep],
-) -> Result<StagedSnapshot> {
+pub fn capture_planned(repo_root: &Path, steps: &[PlanStep]) -> Result<StagedSnapshot> {
     let index = git_path(repo_root, "index")?;
     let scratch = ScratchIndex(index.with_file_name(format!(
         "diffctx-plan-{}-{}.index",
@@ -358,45 +346,14 @@ pub fn capture_planned(
         SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed)
     )));
     let head = rev_oid(repo_root, "HEAD");
-    match start {
-        PlanStart::Index => {
-            if index.exists() {
-                std::fs::copy(&index, &scratch.0)?;
-            }
-        }
-        PlanStart::Picked(_) => {
-            let tree = head.as_deref().unwrap_or("--empty");
-            run_git_on_index(repo_root, &scratch.0, &["read-tree", tree], None)?;
-        }
-    }
-    if let PlanStart::Picked(commits) = start {
-        for commit in commits {
-            let patch = run_git_bytes(
-                repo_root,
-                &[
-                    "diff-tree",
-                    "-p",
-                    "--binary",
-                    "--no-renames",
-                    &format!("{commit}^"),
-                    commit,
-                ],
-            )?;
-            if !patch.trim_ascii().is_empty() {
-                run_git_on_index(
-                    repo_root,
-                    &scratch.0,
-                    &["apply", "--cached", "--whitespace=nowarn"],
-                    Some(&patch),
-                )?;
-            }
-        }
+    if index.exists() {
+        std::fs::copy(&index, &scratch.0)?;
     }
     for (dir, args) in steps {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_git_on_index(dir, &scratch.0, &args, None)?;
+        run_git_on_index(dir, &scratch.0, &args)?;
     }
-    let tree = run_git_on_index(repo_root, &scratch.0, &["write-tree"], None)?
+    let tree = run_git_on_index(repo_root, &scratch.0, &["write-tree"])?
         .trim()
         .to_string();
     let base = head.clone().unwrap_or_else(|| empty_tree_oid(repo_root));
@@ -427,29 +384,15 @@ fn git_path(repo_root: &Path, name: &str) -> Result<PathBuf> {
     })
 }
 
-/// A git command against another index file than the checkout's own, with
-/// optional stdin, under the same supervision as every other call.
-fn run_git_on_index(
-    dir: &Path,
-    index: &Path,
-    args: &[&str],
-    input: Option<&[u8]>,
-) -> Result<String> {
-    let mut cmd = git_command(dir);
-    cmd.env("GIT_INDEX_FILE", index)
+/// A git command against another index file than the checkout's own, under
+/// the same supervision as every other call.
+fn run_git_on_index(dir: &Path, index: &Path, args: &[&str]) -> Result<String> {
+    let child = git_command(dir)
+        .env("GIT_INDEX_FILE", index)
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if input.is_some() {
-        cmd.stdin(Stdio::piped());
-    }
-    let mut child = cmd.spawn()?;
-    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
-        let bytes = bytes.to_vec();
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(&bytes);
-        });
-    }
+        .stderr(Stdio::piped())
+        .spawn()?;
     let output = supervise(child)?;
     if !output.status.success() {
         return Err(command_failure(
@@ -518,10 +461,15 @@ pub fn resolve_duration_range(repo_root: &Path, diff_range: Option<&str>) -> Res
     let trimmed = spec.trim();
     let parsed = parse_duration_seconds(trimmed);
     if parsed.is_none() && !looks_like_duration(trimmed) {
-        return Ok(ResolvedRange {
-            staged: tree_endpoint(repo_root, trimmed),
-            ..ResolvedRange::verbatim(Some(trimmed))
-        });
+        if let Some(staged) = tree_endpoint(repo_root, trimmed) {
+            return Ok(ResolvedRange {
+                staged: Some(staged),
+                ..ResolvedRange::verbatim(Some(trimmed))
+            });
+        }
+        return Ok(ResolvedRange::verbatim(Some(&forked_range(
+            repo_root, trimmed,
+        ))));
     }
     if rev_exists(repo_root, trimmed) {
         return Ok(ResolvedRange::verbatim(Some(trimmed)));
@@ -544,6 +492,27 @@ pub fn resolve_duration_range(repo_root: &Path, diff_range: Option<&str>) -> Res
         from_duration: true,
         staged: None,
     })
+}
+
+/// `A..B` and `A...B` as one range: what `B` changed since it forked from
+/// `A`, both sides as commit ids. git's two-dot diff compares the two trees,
+/// so a base that moved on after the fork — a PR's target branch, a stale
+/// remote-tracking ref — read its own later commits as reverts in the change
+/// (#485, #462); a review wants the fork point, as a forge's "files changed"
+/// does. Histories with no common commit, and anything that is not two
+/// commits, stay as written.
+fn forked_range(repo_root: &Path, range: &str) -> String {
+    let (Some(base), Some(head)) = split_diff_range(range) else {
+        return range.to_string();
+    };
+    let (Some(base_oid), Some(head_oid)) = (rev_oid(repo_root, &base), rev_oid(repo_root, &head))
+    else {
+        return range.to_string();
+    };
+    match run_git(repo_root, &["merge-base", &base_oid, &head_oid]) {
+        Ok(fork) => format!("{}..{head_oid}", fork.trim()),
+        Err(_) => range.to_string(),
+    }
 }
 
 /// Always targets the repo via `-C`.
@@ -1421,6 +1390,35 @@ fn run_grep(repo_root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// What a `git grep` found in the files the run may show, and the files it
+/// found and withheld (repo-relative): an answer built on `rows` counts
+/// `withheld`, since what those files say was never read (#392).
+#[derive(Default)]
+pub struct Grepped<T> {
+    pub rows: Vec<T>,
+    pub withheld: Vec<String>,
+}
+
+/// `git grep` reads every file, so its answers pass the withhold policy here,
+/// at the read: a caller, a stale reference or a declaration in a withheld
+/// file is as withheld as the file. Applied per surface instead, each new
+/// reader of grep printed `.diffctx/ignore`d paths until someone noticed.
+fn admissible<T>(repo_root: &Path, rows: Vec<T>, rel_of: impl Fn(&T) -> String) -> Grepped<T> {
+    let mut rels: Vec<String> = rows.iter().map(&rel_of).collect();
+    rels.sort_unstable();
+    rels.dedup();
+    let withheld = crate::pipeline::withheld_paths(repo_root, &rels);
+    if withheld.is_empty() {
+        return Grepped { rows, withheld };
+    }
+    let hidden: FxHashSet<&str> = withheld.iter().map(String::as_str).collect();
+    let rows = rows
+        .into_iter()
+        .filter(|r| !hidden.contains(rel_of(r).as_str()))
+        .collect();
+    Grepped { rows, withheld }
+}
+
 /// Every line matching the extended regex `pattern` at `rev` (the working
 /// tree when `None`) in the files `pathspec` names: (path, line, text).
 pub fn grep_lines_matching(
@@ -1428,15 +1426,25 @@ pub fn grep_lines_matching(
     pattern: &str,
     rev: Option<&str>,
     pathspec: &[&str],
-) -> Result<Vec<(String, u32, String)>> {
+) -> Result<Grepped<(String, u32, String)>> {
     let mut args: Vec<&str> = vec!["grep", "-n", "-z", "-I", "-E", "-e", pattern];
     args.extend(rev);
     if !pathspec.is_empty() {
         args.push("--");
         args.extend_from_slice(pathspec);
     }
+    grep_rows(repo_root, &args, rev)
+}
+
+/// `git grep -n -z` at `rev` as (repo-relative path, line, text), withheld
+/// files dropped.
+fn grep_rows(
+    repo_root: &Path,
+    args: &[&str],
+    rev: Option<&str>,
+) -> Result<Grepped<(String, u32, String)>> {
     let prefix = rev.map(|r| format!("{r}:")).unwrap_or_default();
-    Ok(run_grep(repo_root, &args)?
+    let rows = run_grep(repo_root, args)?
         .lines()
         .filter_map(|line| {
             let mut parts = line.splitn(3, '\0');
@@ -1445,7 +1453,8 @@ pub fn grep_lines_matching(
             let no = parts.next()?.parse().ok()?;
             Some((path.to_string(), no, parts.next()?.to_string()))
         })
-        .collect())
+        .collect();
+    Ok(admissible(repo_root, rows, |(p, _, _)| p.clone()))
 }
 
 /// Tracked and unignored untracked files holding `word` as a whole word.
@@ -1453,7 +1462,7 @@ pub fn grep_files_with_word(
     repo_root: &Path,
     word: &str,
     pathspec: &[String],
-) -> Result<Vec<PathBuf>> {
+) -> Result<Grepped<PathBuf>> {
     grep_files(repo_root, &["-w", "-F", "-e", word], pathspec)
 }
 
@@ -1463,7 +1472,7 @@ pub fn grep_files_with_declaration(
     repo_root: &Path,
     name: &str,
     pathspec: &[String],
-) -> Result<Vec<PathBuf>> {
+) -> Result<Grepped<PathBuf>> {
     let name = regex::escape(name);
     let pattern = format!(
         r#"((def|class|fn|fun|func|function|struct|interface|trait|enum|type|typealias|module|const|let|var|val|object|define)[[:space:]]+(\([^)]*\)[[:space:]]*)?["']?{name}([^[:alnum:]_$]|$))|((^|[^[:alnum:]_$.]){name}[[:space:]]*[:=][[:space:]]*(function|async|\())"#
@@ -1471,7 +1480,7 @@ pub fn grep_files_with_declaration(
     grep_files(repo_root, &["-E", "-e", &pattern], pathspec)
 }
 
-fn grep_files(repo_root: &Path, pattern: &[&str], pathspec: &[String]) -> Result<Vec<PathBuf>> {
+fn grep_files(repo_root: &Path, pattern: &[&str], pathspec: &[String]) -> Result<Grepped<PathBuf>> {
     let mut args: Vec<&str> = vec!["grep", "--untracked", "-l", "-z", "-I"];
     args.extend_from_slice(pattern);
     if !pathspec.is_empty() {
@@ -1479,11 +1488,49 @@ fn grep_files(repo_root: &Path, pattern: &[&str], pathspec: &[String]) -> Result
         args.push("--");
         args.extend(pathspec.iter().map(String::as_str));
     }
-    Ok(run_grep(repo_root, &args)?
+    let rels = run_grep(repo_root, &args)?
         .split('\0')
         .filter(|p| !p.is_empty() && crate::paths::contains_lexically(Path::new(p)))
-        .map(|p| crate::paths::repo_join(repo_root, p))
-        .collect())
+        .map(str::to_string)
+        .collect();
+    let found = admissible(repo_root, rels, String::clone);
+    Ok(Grepped {
+        rows: found
+            .rows
+            .iter()
+            .map(|p| crate::paths::repo_join(repo_root, p))
+            .collect(),
+        withheld: found.withheld,
+    })
+}
+
+/// Lines of code files at `rev` that hold one of `words` as a whole word, at
+/// most `per_file` per file: where a removed definition's callers are read
+/// from. Unbounded, `-F -e call` matched every `callback` in every data file
+/// of a monorepo and the run never stopped (#413, #457).
+pub fn grep_code_words(
+    repo_root: &Path,
+    words: &[String],
+    rev: Option<&str>,
+    per_file: usize,
+) -> Result<Grepped<(String, u32, String)>> {
+    if words.is_empty() {
+        return Ok(Grepped::default());
+    }
+    let per_file = per_file.to_string();
+    let globs: Vec<String> = crate::config::extensions::CODE_EXTENSIONS
+        .iter()
+        .map(|ext| format!(":(glob,icase)**/*{ext}"))
+        .collect();
+    let mut args: Vec<&str> = vec!["grep", "-n", "-z", "-I", "-F", "-w", "-m", &per_file];
+    for w in words {
+        args.push("-e");
+        args.push(w);
+    }
+    args.extend(rev);
+    args.push("--");
+    args.extend(globs.iter().map(String::as_str));
+    grep_rows(repo_root, &args, rev)
 }
 
 /// Every line holding one of `needles` (fixed strings) at `rev`, or in the
@@ -1492,9 +1539,9 @@ pub fn grep_lines(
     repo_root: &Path,
     needles: &[String],
     rev: Option<&str>,
-) -> Result<Vec<(String, u32, String)>> {
+) -> Result<Grepped<(String, u32, String)>> {
     if needles.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Grepped::default());
     }
     let mut args: Vec<&str> = vec!["grep", "-n", "-z", "-I", "-F"];
     for n in needles {
@@ -1502,17 +1549,7 @@ pub fn grep_lines(
         args.push(n);
     }
     args.extend(rev);
-    let prefix = rev.map(|r| format!("{r}:")).unwrap_or_default();
-    Ok(run_grep(repo_root, &args)?
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(3, '\0');
-            let path = parts.next()?;
-            let path = path.strip_prefix(prefix.as_str()).unwrap_or(path);
-            let no = parts.next()?.parse().ok()?;
-            Some((path.to_string(), no, parts.next()?.to_string()))
-        })
-        .collect())
+    grep_rows(repo_root, &args, rev)
 }
 
 pub fn get_untracked_files(repo_root: &Path, pathspec: &[String]) -> Result<Vec<PathBuf>> {

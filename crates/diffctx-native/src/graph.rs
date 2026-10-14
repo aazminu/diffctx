@@ -103,6 +103,11 @@ pub struct EdgeCapStats {
     /// Names the builder category responsible for near-dense emission
     /// blowups (#116). Empty on the materialized-edge path.
     pub emissions_by_category: Vec<(EdgeCategory, u64, u64)>,
+    /// The source nodes whose out-edges the cap truncated: a caller among
+    /// them may have lost its edge to the definition it calls, which impact
+    /// recovers rather than read as no caller (#446). Empty on the
+    /// materialized-edge path.
+    pub capped_sources: FxHashSet<FragmentId>,
 }
 
 /// A single node-interned edge. 24 bytes instead of a string-keyed
@@ -762,6 +767,7 @@ pub(crate) fn cap_out_edges_per_source(
         nodes_capped,
         max_out_edges_per_node: max_per_node,
         emissions_by_category: Vec::new(),
+        capped_sources: FxHashSet::default(),
     }
 }
 

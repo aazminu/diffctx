@@ -169,7 +169,9 @@ def test_a_cancelled_request_stops_its_native_run_and_git_children(tmp_path, mon
 
     worker = threading.Thread(target=work)
     worker.start()
-    time.sleep(1.0)
+    # Cancel once the stalling git runs, not after a fixed sleep: on a loaded
+    # runner a second was not always enough to reach it (#489).
+    _wait_for(lambda: pids_file.exists() and pids_file.read_text(encoding="utf-8").split(), 30)
     cancelled_at = time.monotonic()
     token.cancel()
     worker.join(timeout=30)
@@ -180,8 +182,14 @@ def test_a_cancelled_request_stops_its_native_run_and_git_children(tmp_path, mon
         assert "cancelled" in coverage, coverage
     stalled = [int(p) for p in pids_file.read_text(encoding="utf-8").split()]
     assert stalled, "the stalling git never ran: the test measured nothing"
-    time.sleep(0.5)
+    _wait_for(lambda: not [pid for pid in stalled if _alive(pid)], 5)
     assert not [pid for pid in stalled if _alive(pid)], "a killed git child outlived the cancellation"
+
+
+def _wait_for(ready, seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while not ready() and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 
 def _alive(pid: int) -> bool:

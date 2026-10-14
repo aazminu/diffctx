@@ -1058,9 +1058,8 @@ impl Resolver<'_> {
                 return direct;
             }
         }
-        let python = lang_of(site.path) == Some(Lang::Python);
-        if let Some(ctor) =
-            constructed_as(site.content, head, python).or_else(|| annotated_as(site.content, head))
+        if let Some(ctor) = constructed_as(site.path, site.content, head)
+            .or_else(|| annotated_as(site.content, head))
         {
             return self.constructor_is(site, &ctor, def, class);
         }
@@ -1099,12 +1098,10 @@ impl Resolver<'_> {
     pub fn classify(&self, site: &Site, def: &Definition) -> Option<Finding> {
         let words = self.names_for(site, def);
         let params = params_of(site.content);
-        let python = lang_of(site.path) == Some(Lang::Python);
-        let mut triple = None;
         let mut best: Option<Finding> = None;
-        for (i, line) in site.content.lines().enumerate() {
-            let code = crate::impact::mask_code(line, python, &mut triple);
-            if is_import_line(&code) {
+        let masked = crate::impact::code_text(site.path, site.content);
+        for (i, code) in masked.lines().enumerate() {
+            if is_import_line(code) {
                 continue;
             }
             let line_no = site.start_line + i as u32;
@@ -1200,7 +1197,7 @@ impl Resolver<'_> {
     }
 }
 
-fn is_import_line(code: &str) -> bool {
+pub(crate) fn is_import_line(code: &str) -> bool {
     let head = code.trim_start();
     head.starts_with("import ")
         || head.starts_with("from ")
@@ -1262,21 +1259,21 @@ fn bases_of(header: &str) -> Vec<String> {
 /// constructor `x` holds. A binding is read within one line: across a
 /// newline, `as srv:` and the next line's `result = srv.call_tool(...)`
 /// read as an annotated assignment from `srv.call_tool` (#399).
-fn constructed_as(content: &str, var: &str, python: bool) -> Option<String> {
+fn constructed_as(path: &str, content: &str, var: &str) -> Option<String> {
     let re = Regex::new(&format!(
         r"(?:^|[^\w$.])({})\s*(?::\s*[\w$.\[\]<>]+\s*)?=\s*(?:new\s+|await\s+)?([\w$.]+)\s*\(",
         regex::escape(var)
     ))
     .ok()?;
-    let mut triple = None;
-    content.lines().find_map(|line| {
-        let code = crate::impact::mask_code(line, python, &mut triple);
-        entered_as(&code, var).or_else(|| {
-            re.captures_iter(&code)
-                .find(|c| c.get(1).is_some_and(|v| !after_as(&code, v.start())))
-                .map(|c| c[2].to_string())
+    crate::impact::code_text(path, content)
+        .lines()
+        .find_map(|code| {
+            entered_as(code, var).or_else(|| {
+                re.captures_iter(code)
+                    .find(|c| c.get(1).is_some_and(|v| !after_as(code, v.start())))
+                    .map(|c| c[2].to_string())
+            })
         })
-    })
 }
 
 /// Whether the name at `at` is the target of an `as` (`with … as x`,

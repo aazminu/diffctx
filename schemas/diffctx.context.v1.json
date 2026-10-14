@@ -843,6 +843,11 @@
           "description": "The caller withdrew the request (an MCP cancellation, the MCP\ndeadline): work stopped at the next poll instead of running on\ndetached.",
           "type": "string",
           "const": "cancelled"
+        },
+        {
+          "description": "A git read the answer depends on failed (`git grep`, a file\nlisting): what it would have found is unknown, never none.",
+          "type": "string",
+          "const": "read_failed"
         }
       ]
     },

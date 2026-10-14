@@ -1813,3 +1813,14 @@ fn a_migration_is_not_a_generated_file_and_protoc_output_still_is() {
     assert_ne!(class("app/migrations/0002_add.py"), "generated", "{doc}");
     assert_eq!(class("app/msg.pb.go"), "generated", "{doc}");
 }
+
+/// `A..B` is read from the fork point: `HEAD..HEAD~1` is empty, and the hint
+/// names git's matching three-dot form rather than a two-tree `--stat`.
+#[test]
+fn an_empty_range_hints_at_its_fork_point_reading() {
+    let tmp = code_change_repo();
+    let out = run(tmp.path(), &[".", "--diff", "HEAD..HEAD~1", "-q"]);
+    assert_eq!(out.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("git diff --stat HEAD...HEAD~1"), "{stderr}");
+}

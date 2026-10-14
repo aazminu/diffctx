@@ -31,6 +31,14 @@
       ]
     },
     "changed_files": {
+      "description": "What git tracks and the change modifies; untracked work is listed\napart, in `untracked_files`.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "untracked_files": {
+      "description": "New files git does not track yet, analysed with the change (#418).",
       "type": "array",
       "items": {
         "type": "string"
@@ -88,6 +96,12 @@
       "format": "uint",
       "minimum": 0
     },
+    "untracked_files_omitted": {
+      "description": "Untracked files left out of `untracked_files` to fit the same cap.",
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
     "contracts_omitted": {
       "description": "Contracts beyond `MAX_CONTRACTS`, schema changes never among them.",
       "type": "integer",
@@ -95,7 +109,7 @@
       "minimum": 0
     },
     "limits": {
-      "description": "The run stopped at a limit that can lose a caller — the deadline, a\ntruncated reverse discovery, a capped candidate universe — and `empty`\nis never claimed while this is set. Caps every real repository trips\n(a large lockfile, the fragment or edge cap) are not listed: they\nfired on every run and made the hook speak on every commit (#306).",
+      "description": "A limit that can have lost a caller, by the rule pack's coverage uses:\na run-wide stop (the deadline, a truncated discovery, a failed git\nread) or a per-file limit on a changed file. `empty` is never claimed\nwhile this is set. The graph's per-node cap, which every real\nrepository trips (#306), is not listed: a caller it cut an edge from\nis recovered by the same tests an edge faces.",
       "type": "array",
       "items": {
         "$ref": "#/$defs/LimitReason"
@@ -117,6 +131,33 @@
       "items": {
         "type": "string"
       }
+    },
+    "untested_called_in_diff": {
+      "description": "The changed definitions of that count whose only callers are inside\nthe diff: live code, not code nothing calls (#441).",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "layout_only": {
+      "description": "Changed definitions whose hunks are comments, formatting or a\nverbatim move only, which no caller sees, so their callers were not\ntraced (#370): `path::symbol (lines)` each. Unsaid, a comment edit\nread \"no resolved static callers\" while the function had three (#498).",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "lockfile_changes": {
+      "description": "Lock files the range changes: dependency versions moved, and what that\nreaches is not traced. Dropped from every count, a dependency bump\nanswered \"No changes to analyse\" (#495).",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "layout_only_omitted": {
+      "description": "`layout_only` entries left out to fit the cap; the count is whole.",
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
     },
     "withheld_files": {
       "description": "Files the run withheld (`.diffctx/ignore`, gitignore, secret names):\nchanged files of the range, or files naming the queried symbol. Their\ncalls and tests were not read, so a zero says nothing about them\n(#392).",
@@ -324,7 +365,7 @@
           ]
         },
         "reason": {
-          "description": "`no_grammar`, `parse_timeout`, `parse_failed` (nothing read), or\n`parse_partial` (read but for the error lines).",
+          "description": "`no_grammar`, `parse_timeout`, `parse_failed` (nothing read),\n`parse_partial` (read but for the error lines), `too_large` (over the\nsize cap) or `unreadable`.",
           "type": "string"
         },
         "lines": {
@@ -397,6 +438,11 @@
           "description": "The caller withdrew the request (an MCP cancellation, the MCP\ndeadline): work stopped at the next poll instead of running on\ndetached.",
           "type": "string",
           "const": "cancelled"
+        },
+        {
+          "description": "A git read the answer depends on failed (`git grep`, a file\nlisting): what it would have found is unknown, never none.",
+          "type": "string",
+          "const": "read_failed"
         }
       ]
     }

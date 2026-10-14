@@ -109,13 +109,21 @@ pub fn collect_candidate_files(
     ctx: &crate::resource::RunContext,
 ) -> Vec<PathBuf> {
     let source = crate::source::current();
-    if let Some(blobs) = source.list_blobs(scope) {
-        let admitted = blobs
-            .into_iter()
-            .filter(|b| is_snapshot_candidate(b, root_dir, included_set, &source, ctx))
-            .map(|b| b.path)
-            .collect();
-        return filter_ignored_and_secret(root_dir, admitted);
+    match source.list_blobs(scope) {
+        Some(Ok(blobs)) => {
+            let admitted = blobs
+                .into_iter()
+                .filter(|b| is_snapshot_candidate(b, root_dir, included_set, &source, ctx))
+                .map(|b| b.path)
+                .collect();
+            return filter_ignored_and_secret(root_dir, admitted);
+        }
+        Some(Err(e)) => {
+            tracing::warn!("discovery: the snapshot's listing failed ({e})");
+            ctx.note(crate::resource::reason_for(&e));
+            return Vec::new();
+        }
+        None => {}
     }
     match tracked_candidates(root_dir, included_set, scope, ctx) {
         Some(files) => filter_ignored_and_secret(root_dir, files),

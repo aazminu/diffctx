@@ -418,10 +418,13 @@ fn collect_capped_edges_from(
     cap_out_edges_per_source(&mut edges, max_per_node);
     ctx.record_usage(|u| u.final_edges = edges.len() as u64);
 
-    let nodes_capped = out_degree
+    let capped_sources: FxHashSet<FragmentId> = out_degree
         .iter()
-        .filter(|&&d| d as usize > max_per_node)
-        .count();
+        .enumerate()
+        .filter(|&(_, &d)| d as usize > max_per_node)
+        .map(|(i, _)| idx_to_node[i].clone())
+        .collect();
+    let nodes_capped = capped_sources.len();
     let cap_stats = EdgeCapStats {
         edges_before_cap: deduped_edge_count,
         edges_after_cap: edges.len(),
@@ -429,6 +432,7 @@ fn collect_capped_edges_from(
         nodes_capped,
         max_out_edges_per_node: max_per_node,
         emissions_by_category,
+        capped_sources,
     };
 
     CappedEdges {

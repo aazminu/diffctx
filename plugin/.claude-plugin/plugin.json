@@ -25,14 +25,14 @@
   "userConfig": {
     "impact_hook": {
       "type": "boolean",
-      "title": "Impact before commit, merge and push",
-      "description": "Before git commit/merge/cherry-pick/push or a PR, and after a git diff or git status, show what the pending change reaches outside the diff (once per change, never blocks)",
+      "title": "Impact of each commit, merge and push",
+      "description": "Once a git commit/merge/cherry-pick/revert/push has run, before a PR is created, and after a git diff or git status, show what the change reaches outside the diff (once per change, never blocks)",
       "default": true
     },
     "impact_gate": {
       "type": "boolean",
       "title": "Strict gate: no commit before its impact was reviewed",
-      "description": "Deny git commit/merge/push until the change's impact has been shown once (by the hook, a manual --mode impact run, or the /diffctx:impact skill); the retry passes. Fixing a caller changes the content, so the next attempt is denied once more with the new impact.",
+      "description": "Deny a git commit until the impact of the index it records has been shown once (by the hook, a manual --mode impact run, or the /diffctx:impact skill); the retry passes. A commit line that stages for itself (git add on the same line, paths, -a) is asked to stage first. Fixing a caller changes the content, so the next attempt is denied once more with the new impact.",
       "default": false
     }
   }

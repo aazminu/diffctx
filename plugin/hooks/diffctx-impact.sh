@@ -35,10 +35,14 @@ searches_pending_change() {
   [[ $payload =~ $re ]] && dir=${BASH_REMATCH[1]}
   re='(^|[[:space:]"])cd[[:space:]]+((/|~/)[^[:space:];&|"\\]+)'
   [[ $command =~ $re ]] && dir=${BASH_REMATCH[2]}
+  # A Grep searches its own `path`, which need not be under the cwd (#407).
+  re='"tool_name"[[:space:]]*:[[:space:]]*"Grep".*"tool_input"[[:space:]]*:[[:space:]]*\{[^}]*"path"[[:space:]]*:[[:space:]]*"(/[^"]*)"'
+  [[ $payload =~ $re ]] && dir=${BASH_REMATCH[1]}
   # The payload's literal `~/`, expanded the way the shell running the command will.
   [[ ${dir:0:1} == "~" && ${dir:1:1} == / ]] && dir="${HOME:-}/${dir:2}"
-  git -C "$dir" diff --quiet HEAD -- 2>/dev/null
-  [[ $? -eq 1 ]]
+  [[ -f $dir ]] && dir=$(dirname "$dir")
+  # Untracked files are a pending change too.
+  [[ -n $(git -C "$dir" status --porcelain 2>/dev/null) ]]
 }
 case "$payload" in
 *'git '* | *'gh '*) ;;

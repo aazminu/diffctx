@@ -412,3 +412,102 @@ fn a_caller_deleted_only_on_disk_is_still_a_caller_of_the_snapshot() {
         );
     }
 }
+
+fn json_of(repo: &Path, args: &[&str]) -> serde_json::Value {
+    let out = run(repo, args);
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("JSON")
+}
+
+/// #409: every mode that takes `staged` reads the index, not the disk: an
+/// edit made after the add is neither a changed file nor fragment content.
+#[test]
+fn every_mode_reads_the_staged_change_from_the_index() {
+    let tmp = shop();
+    let repo = tmp.path();
+    write(repo, "shop/pricing.py", TOTAL_CHANGED);
+    git(repo, &["add", "shop/pricing.py"]);
+    write(
+        repo,
+        "shop/pricing.py",
+        &TOTAL_CHANGED.replace("* 2", "* 3"),
+    );
+    write(
+        repo,
+        "shop/report.py",
+        "def summarize(rows):\n    return rows\n",
+    );
+    for mode in [&["--mode", "pack"][..], &["--full"], &["--mode", "locate"]] {
+        let mut args = vec![".", "--diff", "staged", "-q", "-f", "json"];
+        args.extend_from_slice(mode);
+        let doc = json_of(repo, &args);
+        assert_eq!(
+            doc["changed_files"],
+            serde_json::json!(["shop/pricing.py"]),
+            "{mode:?}: {doc}"
+        );
+        let text = doc.to_string();
+        assert!(!text.contains("* 3"), "{mode:?} read the disk: {text}");
+        if mode != ["--mode", "locate"] {
+            assert!(text.contains("* 2"), "{mode:?}: {text}");
+        }
+    }
+}
+
+/// #409: a staged rename and a staged mode change are changes of the
+/// index in every mode, and the renamed-away path is no changed file.
+#[cfg(unix)]
+#[test]
+fn a_staged_rename_and_mode_change_are_read_in_every_mode() {
+    let tmp = shop();
+    let repo = tmp.path();
+    git(repo, &["mv", "shop/billing.py", "shop/invoicing.py"]);
+    git(repo, &["update-index", "--chmod=+x", "shop/checkout.py"]);
+    for mode in [&["--mode", "pack"][..], &["--full"], &["--mode", "locate"]] {
+        let mut args = vec![".", "--diff", "staged", "-q", "-f", "json"];
+        args.extend_from_slice(mode);
+        let doc = json_of(repo, &args);
+        let changed: Vec<&str> = doc["changed_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(!changed.contains(&"shop/billing.py"), "{mode:?}: {doc}");
+        assert!(changed.contains(&"shop/checkout.py"), "{mode:?}: {doc}");
+    }
+}
+
+/// #409: `--full A..B` shows what `B` holds; a file `B` deleted or renamed
+/// away is no changed content, its old body read from `A` was.
+#[test]
+fn full_over_a_range_never_shows_a_deleted_or_renamed_away_body() {
+    let tmp = shop();
+    let repo = tmp.path();
+    git(repo, &["rm", "-q", "shop/billing.py"]);
+    git(repo, &["mv", "shop/checkout.py", "shop/payment.py"]);
+    write(repo, "shop/pricing.py", TOTAL_CHANGED);
+    git(repo, &["add", "-A"]);
+    git(
+        repo,
+        &["commit", "-q", "-m", "drop billing, rename checkout"],
+    );
+    let doc = json_of(
+        repo,
+        &[".", "--diff", "HEAD~1..HEAD", "--full", "-q", "-f", "json"],
+    );
+    let text = doc.to_string();
+    assert!(!text.contains("def invoice"), "deleted body shown: {text}");
+    let paths: Vec<&str> = doc["fragments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .collect();
+    assert!(!paths.contains(&"shop/checkout.py"), "{paths:?}");
+    assert!(!paths.contains(&"shop/billing.py"), "{paths:?}");
+}

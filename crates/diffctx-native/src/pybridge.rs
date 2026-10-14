@@ -144,6 +144,7 @@ fn build_locate(
     paths = Vec::new(),
     markdown = false,
     symbol = None,
+    budget = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_impact(
@@ -156,6 +157,7 @@ fn build_impact(
     paths: Vec<String>,
     markdown: bool,
     symbol: Option<String>,
+    budget: Option<i64>,
 ) -> PyResult<String> {
     let mode =
         ScoringMode::from_str(scoring_mode).map_err(pyo3::exceptions::PyValueError::new_err)?;
@@ -168,7 +170,7 @@ fn build_impact(
     // A scoped answer reviewed part of the change; the gate keys on all of it.
     let mark =
         (paths.is_empty() && symbol.is_none()).then(|| diff_range_or_head(diff_range).to_string());
-    let output = detach_guarded(py, move || {
+    let mut output = detach_guarded(py, move || {
         if let Some(symbol) = symbol {
             return crate::pipeline::build_symbol_impact(
                 &path, &symbol, &paths, alpha, mode, timeout,
@@ -187,11 +189,9 @@ fn build_impact(
         }
         Ok(output)
     })?;
-    if markdown {
-        return Ok(crate::impact::render_markdown(&output));
-    }
-    serde_json::to_string(&output)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    // -1 is unlimited, as for pack; past u32, too.
+    let cap = budget.map(|b| u32::try_from(b).unwrap_or(u32::MAX));
+    Ok(crate::impact::deliver(&mut output, markdown, cap))
 }
 
 /// `diffctx hook <event>` for installs that reach diffctx through the PyPI
@@ -466,7 +466,13 @@ fn resolve_diff_range(py: Python<'_>, root_dir: &str, diff_range: &str) -> PyRes
     let resolved = py
         .detach(move || crate::git::resolve_duration_range(&root, range.as_deref()))
         .map_err(|e| GitError::new_err(e.to_string()))?;
-    Ok(resolved.range.unwrap_or_default())
+    // Every other range resolves too (to its fork point), but what the
+    // caller phrases is the window, not a commit id.
+    Ok(if resolved.from_duration {
+        resolved.range.unwrap_or_default()
+    } else {
+        diff_range.to_string()
+    })
 }
 
 #[pyfunction]

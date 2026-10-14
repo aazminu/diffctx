@@ -29,7 +29,7 @@ from diffctx.version import __version__
 from diffctx.writer import tree_to_string
 
 from .fetch import fetch_result
-from .security import validate_repo_path
+from .security import validate_repo_path, validate_scope
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +170,12 @@ async def _locate_response(validated_path: Path, diff_range: str, budget_tokens:
 # impact is a finding, not a failure, and it is what the plugin hook stays
 # silent on.
 async def _impact_response(
-    validated_path: Path, diff_range: str, clipboard: bool, max_tokens: int, symbol: str | None = None
+    validated_path: Path,
+    diff_range: str,
+    clipboard: bool,
+    max_tokens: int,
+    budget_tokens: int,
+    symbol: str | None = None,
 ) -> str:
     try:
         payload = await _run_with_deadline(
@@ -182,6 +187,7 @@ async def _impact_response(
                 timeout=_DEFAULT_TIMEOUT_SECONDS,
                 markdown=True,
                 symbol=symbol,
+                budget=budget_tokens,
             ),
         )
     except GitError as e:
@@ -329,11 +335,15 @@ async def diffctx_context(
     symbol: str | None = None,
 ) -> str:
     validated_path = validate_repo_path(repo_path)
+    scope = validate_scope(repo_path)
     _validate_max_tokens(max_tokens)
     if symbol is not None:
         if diff_ref or fragment_ids or mode != "impact":
-            raise ValueError("symbol answers in mode impact, without diff_ref or fragment_ids")
-        return await _impact_response(validated_path, "", clipboard, max_tokens, symbol=symbol)
+            raise ValueError(
+                'symbol looks the name up in the working tree: call again with mode="impact" '
+                "and drop diff_ref and fragment_ids"
+            )
+        return await _impact_response(scope, "", clipboard, max_tokens, budget_tokens, symbol=symbol)
     ref = diff_ref if diff_ref else await anyio.to_thread.run_sync(_default_diff_ref, validated_path)
 
     # fragment_ids is the second half of the locate flow, so it decides the
@@ -349,10 +359,10 @@ async def diffctx_context(
     if include_raw_diff and mode != "pack":
         raise ValueError(f'mode="{mode}" emits no source; include_raw_diff applies to mode="pack" only')
     if mode == "impact":
-        return await _impact_response(validated_path, ref, clipboard, max_tokens)
+        return await _impact_response(scope, ref, clipboard, max_tokens, budget_tokens)
     if mode == "locate":
-        return await _locate_response(validated_path, ref, budget_tokens, clipboard, max_tokens)
-    return await _pack_response(validated_path, ref, budget_tokens, clipboard, max_tokens, include_raw_diff)
+        return await _locate_response(scope, ref, budget_tokens, clipboard, max_tokens)
+    return await _pack_response(scope, ref, budget_tokens, clipboard, max_tokens, include_raw_diff)
 
 
 async def _fetch_response(validated_path: Path, diff_ref: str, fragment_ids: list[str], clipboard: bool, max_tokens: int) -> str:

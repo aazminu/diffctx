@@ -46,6 +46,9 @@ pub enum LimitReason {
     /// deadline): work stopped at the next poll instead of running on
     /// detached.
     Cancelled,
+    /// A git read the answer depends on failed (`git grep`, a file
+    /// listing): what it would have found is unknown, never none.
+    ReadFailed,
     EvidenceBudgetExceeded,
     SelectionBudgetExceeded,
     SanitizationRedaction,
@@ -83,6 +86,11 @@ pub const DEFAULT_MAX_EDGE_CONTRIBUTIONS: u64 = 20_000_000;
 /// still reaches the phases instead of failing in `rev-parse`. Semantic — it
 /// changes the artifact — and hashed through `resources.max_wall_secs`.
 pub const TEST_DEADLINE_EXPIRED_ENV: &str = "DIFFCTX_TEST_DEADLINE_EXPIRED";
+
+/// Test hook: the deadline fires at the `n`th poll, whatever the clock says,
+/// so a test can stop a run at every point it can stop without racing the
+/// wall clock (#510, #489, #502). Semantic, like the expired deadline.
+pub const TEST_DEADLINE_AFTER_POLLS_ENV: &str = "DIFFCTX_TEST_DEADLINE_AFTER_POLLS";
 
 impl ResourceBudget {
     pub fn resolve(timeout_secs: u64) -> Self {
@@ -161,6 +169,7 @@ impl LimitReason {
             self,
             Self::Deadline
                 | Self::Cancelled
+                | Self::ReadFailed
                 | Self::DiscoveryTruncated
                 | Self::CandidateLimit
                 | Self::TotalByteLimit
@@ -279,8 +288,12 @@ struct Inner {
     reasons: Mutex<BTreeSet<LimitReason>>,
     usage: Mutex<ResourceUsage>,
     limited_files: Mutex<BTreeSet<(String, LimitReason)>>,
+    /// Files a read found and the withhold policy kept out, repo-relative.
+    withheld: Mutex<BTreeSet<String>>,
     head_rev: Mutex<Option<String>>,
     source: Mutex<Option<crate::source::Source>>,
+    /// Polls left before the logical clock fires; `None` outside a test.
+    polls_left: Option<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -311,6 +324,10 @@ impl RunContext {
             }
         };
         let expires_at = after(budget.max_wall_secs);
+        let polls_left = expires_at
+            .and_then(|_| std::env::var(TEST_DEADLINE_AFTER_POLLS_ENV).ok())
+            .and_then(|n| n.parse().ok())
+            .map(AtomicU64::new);
         let io_expires_at = after(io_secs);
         let cancel = PENDING_CANCEL
             .with(|c| c.borrow().clone())
@@ -326,8 +343,10 @@ impl RunContext {
                 reasons: Mutex::new(BTreeSet::new()),
                 usage: Mutex::new(ResourceUsage::default()),
                 limited_files: Mutex::new(BTreeSet::new()),
+                withheld: Mutex::new(BTreeSet::new()),
                 head_rev: Mutex::new(None),
                 source: Mutex::new(None),
+                polls_left,
             }),
         }
     }
@@ -374,6 +393,7 @@ impl RunContext {
     }
 
     pub fn set_source(&self, source: crate::source::Source) {
+        source.report_to(RunNotes(Arc::downgrade(&self.inner)));
         *self.inner.source.lock().unwrap() = Some(source);
     }
 
@@ -409,7 +429,16 @@ impl RunContext {
             self.inner.tripped.store(true, Ordering::Relaxed);
             return false;
         }
+        let logical = self.inner.polls_left.as_ref().is_some_and(|left| {
+            left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_err()
+        });
         match self.inner.expires_at {
+            _ if logical => {
+                self.note(LimitReason::Deadline);
+                self.inner.tripped.store(true, Ordering::Relaxed);
+                false
+            }
             Some(expires_at) if Instant::now() >= expires_at => {
                 self.note(LimitReason::Deadline);
                 self.inner.tripped.store(true, Ordering::Relaxed);
@@ -423,6 +452,18 @@ impl RunContext {
         self.inner.cancel.load(Ordering::Relaxed)
     }
 
+    /// `items`, ending at the first poll past the deadline, which `check`
+    /// notes: a loop over an input-sized list is bounded by being one, not
+    /// by remembering to poll — the stale-reference loop that had no poll
+    /// ran a one-second run to 3.2 s (#510).
+    pub fn bounded<'a, I>(&'a self, items: I) -> impl Iterator<Item = I::Item> + 'a
+    where
+        I: IntoIterator,
+        I::IntoIter: 'a,
+    {
+        items.into_iter().take_while(move |_| self.check())
+    }
+
     /// Whether the deadline has fired, without re-checking the clock.
     pub fn tripped(&self) -> bool {
         self.inner.tripped.load(Ordering::Relaxed)
@@ -430,6 +471,16 @@ impl RunContext {
 
     pub fn note(&self, reason: LimitReason) {
         self.inner.reasons.lock().unwrap().insert(reason);
+    }
+
+    /// Files a read left out under the withhold policy: the answer counts
+    /// them, since what they say was never read (#392).
+    pub fn note_withheld(&self, paths: Vec<String>) {
+        self.inner.withheld.lock().unwrap().extend(paths);
+    }
+
+    pub fn withheld_count(&self) -> usize {
+        self.inner.withheld.lock().unwrap().len()
     }
 
     pub fn reasons(&self) -> Vec<LimitReason> {
@@ -504,6 +555,35 @@ impl Drop for ScopedContext {
 
 fn with_current<T>(f: impl FnOnce(&RunContext) -> T) -> Option<T> {
     CURRENT.with(|c| c.borrow().as_ref().map(f))
+}
+
+/// A run that something it owns can note into without keeping it alive: the
+/// source a run holds reports its failed reads here, from any thread.
+#[derive(Clone)]
+pub struct RunNotes(std::sync::Weak<Inner>);
+
+impl RunNotes {
+    pub fn note(&self, reason: LimitReason) {
+        if let Some(inner) = self.0.upgrade() {
+            inner.reasons.lock().unwrap().insert(reason);
+        }
+    }
+}
+
+/// The current run's note, when this thread runs one.
+pub fn note_current(reason: LimitReason) {
+    with_current(|ctx| ctx.note(reason));
+}
+
+/// What a failed git read leaves the answer missing, as a limit: out of time
+/// or cancelled is the deadline, an oversized blob its size, anything else a
+/// read that failed.
+pub fn reason_for(e: &crate::git::GitError) -> LimitReason {
+    match e {
+        crate::git::GitError::Timeout(_) | crate::git::GitError::Cancelled => LimitReason::Deadline,
+        crate::git::GitError::BlobTooLarge { .. } => LimitReason::FileTooLarge,
+        _ => LimitReason::ReadFailed,
+    }
 }
 
 /// Runs `f` with `flag` as the cancellation of every run it starts.

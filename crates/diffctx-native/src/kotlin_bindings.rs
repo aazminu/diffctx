@@ -867,6 +867,7 @@ impl<'a> KotlinResolver<'a> {
                 rev.as_deref(),
                 &["*.kt", "*.kts"],
             )
+            .map(|g| g.rows)
             .unwrap_or_default();
             for (path, _, text) in declared {
                 for name in declared_type_names(&text) {

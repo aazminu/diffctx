@@ -18,7 +18,7 @@ zero.
 ## Install
 
 ```bash
-# Claude Code: the MCP server, /diffctx:impact, and hooks that run it before commit and push
+# Claude Code: the MCP server, /diffctx:impact, and hooks that run it on each commit and push
 claude plugin marketplace add nikolay-e/diffctx
 claude plugin install diffctx@diffctx
 

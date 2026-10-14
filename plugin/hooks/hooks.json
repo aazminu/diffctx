@@ -1,5 +1,5 @@
 {
-  "description": "Warms uv's cache with the pinned diffctx package at session start; before a git commit, merge, cherry-pick, push or a PR is created, and after a search for a name the pending change defines, hands Claude what the change reaches outside the diff",
+  "description": "Warms uv's cache with the pinned diffctx package at session start; once a git commit, merge, cherry-pick, revert or push has run, before a PR is created, and after a git diff, git status or a search for a name the pending change defines, hands Claude what the change reaches outside the diff",
   "hooks": {
     "SessionStart": [
       {

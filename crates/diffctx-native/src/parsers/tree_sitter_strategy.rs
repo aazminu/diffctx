@@ -714,6 +714,218 @@ pub fn has_grammar(path: &str) -> bool {
     find_lang_config(path).is_some_and(|c| LANGUAGE_CACHE.contains_key(c.ts_name))
 }
 
+/// `content` as a reference search reads it: every comment and string
+/// literal blanked to spaces, the expressions inside an interpolation
+/// (`f"{f(x)}"`, `` `${f(x)}` ``, `"#{f(x)}"`) kept, lines and columns
+/// unchanged. Read off the file's grammar: a hand lexer took `//` for a
+/// comment in Python, a lifetime for a quote, and blanked every
+/// interpolated call (#460, #475). A snippet's common indentation is
+/// removed for the parse and put back. `None` without a grammar or when
+/// the parse timed out. Each text is parsed once: a caller is checked
+/// against every changed definition.
+pub fn code_only(path: &str, content: &str) -> Option<Arc<str>> {
+    let config = find_lang_config(path)?;
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        (config.ts_name, content).hash(&mut h);
+        h.finish()
+    };
+    if let Some(known) = MASKS.lock().ok().and_then(|m| m.get(&key).cloned()) {
+        return Some(known);
+    }
+    let indent = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start_matches([' ', '\t']).len())
+        .min()
+        .unwrap_or(0);
+    let mut dedented = String::with_capacity(content.len());
+    let mut kept: Vec<&str> = Vec::new();
+    for line in content.split_inclusive('\n') {
+        let cut = indent.min(line.len() - line.trim_start_matches([' ', '\t']).len());
+        kept.push(&line[..cut]);
+        dedented.push_str(&line[cut..]);
+    }
+    let tree = parse_tree(config.ts_name, &dedented)?;
+    let original = dedented.as_bytes();
+    let mut out = original.to_vec();
+    blank_non_code(tree.root_node(), original, &mut out);
+    let masked = String::from_utf8(out).ok()?;
+    let mut result = String::with_capacity(content.len());
+    for (line, prefix) in masked.split_inclusive('\n').zip(kept) {
+        result.push_str(prefix);
+        result.push_str(line);
+    }
+    let result: Arc<str> = result.into();
+    if let Ok(mut map) = MASKS.lock() {
+        if map.len() >= OUTCOME_LIMIT {
+            map.clear();
+        }
+        map.insert(key, result.clone());
+    }
+    Some(result)
+}
+
+static MASKS: Lazy<std::sync::Mutex<FxHashMap<u64, Arc<str>>>> =
+    Lazy::new(|| std::sync::Mutex::new(FxHashMap::default()));
+
+/// A named declaration the grammar sees: a function, method, class,
+/// interface or a member signature, with the container it sits in.
+#[derive(Debug, Clone)]
+pub struct Declaration {
+    pub name: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    /// The statement's first line, wrappers included (`export`, a
+    /// decorator): what visibility is read off.
+    pub head: String,
+    /// The declaring class, interface or trait, when there is one.
+    pub container: Option<usize>,
+}
+
+/// Every named declaration in `content` that code outside its function can
+/// reach: a function's own locals are left out. `None` without a grammar.
+/// The removed definitions of a change are compared on these, base against
+/// head, rather than read off removed lines by regex (#515).
+pub fn declarations(path: &str, content: &str) -> Option<Vec<Declaration>> {
+    let config = find_lang_config(path)?;
+    let tree = parse_tree(config.ts_name, content)?;
+    let mut out = Vec::new();
+    collect_declarations(tree.root_node(), content, None, &mut out);
+    Some(out)
+}
+
+fn declares(kind: &str) -> bool {
+    const DECLARING: [&str; 13] = [
+        "function",
+        "method",
+        "class",
+        "interface",
+        "struct",
+        "enum",
+        "trait",
+        "type_alias",
+        "type_item",
+        "type_spec",
+        "module",
+        "mod_item",
+        "signature",
+    ];
+    const NOT: [&str; 8] = [
+        "call",
+        "invocation",
+        "expression",
+        "reference",
+        "access",
+        "argument",
+        "parameter",
+        "type_annotation",
+    ];
+    DECLARING.iter().any(|k| kind.contains(k)) && !NOT.iter().any(|k| kind.contains(k))
+}
+
+fn collect_declarations(
+    node: Node,
+    content: &str,
+    container: Option<usize>,
+    out: &mut Vec<Declaration>,
+) {
+    let kind = node.kind();
+    let named = declares(kind)
+        .then(|| node.child_by_field_name("name"))
+        .flatten()
+        .and_then(|n| n.utf8_text(content.as_bytes()).ok());
+    let mut inner = container;
+    if let Some(name) = named {
+        let mut start = node;
+        while let Some(parent) = start.parent() {
+            if !matches!(parent.kind(), "export_statement" | "decorated_definition") {
+                break;
+            }
+            start = parent;
+        }
+        let head = content[start.start_byte()..]
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        out.push(Declaration {
+            name: name.to_string(),
+            start_line: node_start_line(&start),
+            end_line: node_end_line(&node),
+            head,
+            container,
+        });
+        // A function's body declares locals nothing outside it reaches.
+        if (kind.contains("function") || kind.contains("method")) && !kind.contains("signature") {
+            return;
+        }
+        inner = Some(out.len() - 1);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_declarations(child, content, inner, out);
+    }
+}
+
+fn is_interpolation(kind: &str) -> bool {
+    matches!(
+        kind,
+        "interpolation"
+            | "template_substitution"
+            | "interpolated_expression"
+            | "interpolated_identifier"
+            | "string_interpolation"
+    )
+}
+
+fn is_literal_text(kind: &str) -> bool {
+    kind.contains("string") || kind.contains("char_literal") || kind.contains("heredoc")
+}
+
+fn blank(out: &mut [u8], range: std::ops::Range<usize>) {
+    for b in &mut out[range] {
+        if *b != b'\n' {
+            *b = b' ';
+        }
+    }
+}
+
+/// Blanks `node`'s comments and literal text in `out`; an interpolation's
+/// bytes are restored from `original` and read as code again.
+fn blank_non_code(node: Node, original: &[u8], out: &mut [u8]) {
+    let kind = node.kind();
+    if kind.contains("comment") {
+        blank(out, node.byte_range());
+        return;
+    }
+    if is_literal_text(kind) && !is_interpolation(kind) {
+        blank(out, node.byte_range());
+        keep_interpolations(node, original, out);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        blank_non_code(child, original, out);
+    }
+}
+
+/// The interpolations anywhere inside a blanked literal, an implicitly
+/// concatenated one included, read as code again.
+fn keep_interpolations(node: Node, original: &[u8], out: &mut [u8]) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if is_interpolation(child.kind()) {
+            let range = child.byte_range();
+            out[range.clone()].copy_from_slice(&original[range]);
+            blank_non_code(child, original, out);
+        } else {
+            keep_interpolations(child, original, out);
+        }
+    }
+}
+
 /// How a file's grammar read it: the fragmenter records it for the bytes it
 /// parsed, so a reader asking later learns what happened rather than
 /// guessing from the fragments that came out (#454).
@@ -2215,6 +2427,72 @@ mod injection_scale_tests {
             "helper0 spans {}-{} — a 5-line function must not absorb its siblings",
             helper0.id.start_line,
             helper0.id.end_line
+        );
+    }
+}
+
+#[cfg(test)]
+mod code_only_tests {
+    use super::*;
+
+    /// Per grammar: `call` is code (a call, an interpolated call); `hidden`
+    /// sits in a string or a comment and must not be.
+    #[test]
+    fn strings_and_comments_are_blanked_and_interpolations_kept() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "a.py",
+                "x = f\"{seen(1)}\"  # hidden(2)\ny = 'hidden(3)'\nz = a // b\n",
+            ),
+            (
+                "a.ts",
+                "const x = `${seen(1)}`; // hidden(2)\nconst y = 'hidden(3)';\n",
+            ),
+            (
+                "a.rs",
+                "fn f<'a>(s: &'a str) { seen(1); let x = \"hidden(2)\"; /* hidden(3) */ }\n",
+            ),
+            (
+                "a.go",
+                "func f() { seen(1); x := `hidden(2)` // hidden(3)\n}\n",
+            ),
+            ("a.rb", "x = \"#{seen(1)}\" # hidden(2)\ny = 'hidden(3)'\n"),
+            (
+                "a.kt",
+                "val x = \"${seen(1)}\" // hidden(2)\nval y = \"hidden(3)\"\n",
+            ),
+            (
+                "a.cs",
+                "var x = $\"{seen(1)}\"; // hidden(2)\nvar y = \"hidden(3)\";\n",
+            ),
+            (
+                "a.java",
+                "int x = seen(1); // hidden(2)\nString y = \"hidden(3)\";\n",
+            ),
+            (
+                "a.php",
+                "<?php $x = seen(1); // hidden(2)\n$y = 'hidden(3)';\n",
+            ),
+        ];
+        // A grammar this build leaves out is no case; Python and TypeScript
+        // are always compiled in.
+        assert!(has_grammar("a.py") && has_grammar("a.ts"));
+        for (path, src) in cases.iter().filter(|(p, _)| has_grammar(p)) {
+            let code = code_only(path, src).expect("a grammar parses it");
+            assert_eq!(code.len(), src.len(), "{path}: positions kept");
+            assert!(code.contains("seen(1)"), "{path}: {code:?}");
+            assert!(!code.contains("hidden"), "{path}: {code:?}");
+        }
+        // An indented snippet parses as written, its indentation restored.
+        let method = "    def m(self):\n        return f\"{seen(1)}\"  # hidden(2)\n";
+        let code = code_only("a.py", method).expect("parses");
+        assert!(
+            code.starts_with("    def m(self):\n        return"),
+            "{code:?}"
+        );
+        assert!(
+            code.contains("seen(1)") && !code.contains("hidden"),
+            "{code:?}"
         );
     }
 }

@@ -133,6 +133,27 @@ class TestImpactMcp:
         assert "summarize (4-5) — no static test link found" in text
 
     @pytest.mark.asyncio
+    async def test_a_subdirectory_is_the_scope_the_cli_reads(self, server, tmp_path):
+        # #457: the server widened `repo_path=<repo>/one` to the whole
+        # repository, and on a monorepo range that ran past its deadline while
+        # the CLI answered the same subdirectory in seconds.
+        repo = Pygit2Repo(tmp_path / "mono")
+        for project in ("one", "two"):
+            repo.add_file(f"{project}/core.py", "def run():\n    return 1\n")
+        base = repo.commit("initial")
+        for project in ("one", "two"):
+            repo.add_file(f"{project}/core.py", "def run():\n    return 2\n")
+        head = repo.commit("both")
+        result = await server.call_tool(
+            "diffctx_context",
+            {"repo_path": str(repo.path / "one"), "diff_ref": f"{base}..{head}", "mode": "impact"},
+        )
+        cli = _run(repo.path, ["one", "--diff", f"{base}..{head}", "--mode", "impact", "-f", "md", "-q"])
+        header = _get_text(result).splitlines()[0]
+        assert "1 changed file(s)" in header, header
+        assert header == cli.stdout.splitlines()[0]
+
+    @pytest.mark.asyncio
     async def test_mode_impact_refuses_the_raw_diff(self, server, impact_repo):
         from mcp.server.mcpserver.exceptions import ToolError
 
@@ -265,7 +286,7 @@ class TestSymbolQuery:
     @pytest.mark.parametrize(
         ("arguments", "refusal"),
         [
-            ({"symbol": "total", "diff_ref": "HEAD~1"}, "symbol answers in mode impact"),
+            ({"symbol": "total", "diff_ref": "HEAD~1"}, "drop diff_ref and fragment_ids"),
             ({"symbol": "no_such_function"}, 'no definition of "no_such_function" found'),
             ({"symbol": ""}, "--symbol takes NAME"),
         ],

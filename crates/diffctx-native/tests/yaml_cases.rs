@@ -466,6 +466,22 @@ fn run_case_with_scoring(
         60,
     )
     .map_err(|e| Failed::from(format!("pipeline: {e}")))?;
+    // A run its deadline stopped answered a smaller question: under a loaded
+    // full `cargo test` that is a timing failure, and it says so instead of
+    // failing on a score with nothing to read (#390).
+    if let Some(stop) = output.coverage.as_ref().and_then(|c| {
+        c.limit_reasons.iter().find(|r| {
+            matches!(
+                r,
+                _diffctx::resource::LimitReason::Deadline
+                    | _diffctx::resource::LimitReason::Cancelled
+            )
+        })
+    }) {
+        return Err(Failed::from(format!(
+            "the run stopped at {stop:?} before scoring: a timing failure under load, not a selection result"
+        )));
+    }
 
     if contributes_context_only {
         if output.fragments.is_empty() {

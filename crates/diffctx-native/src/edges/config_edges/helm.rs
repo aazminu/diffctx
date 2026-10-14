@@ -79,10 +79,16 @@ fn extract_yaml_keys(content: &str, max_depth: usize) -> FxHashSet<String> {
     keys
 }
 
+/// The chart directory above `path`, in the analysed source: a snapshot's
+/// chart is its own, whatever the disk holds (#408).
 fn get_chart_root(path: &Path) -> Option<PathBuf> {
+    let source = crate::source::current();
     let mut current = path.parent()?.to_path_buf();
     for _ in 0..5 {
-        if current.join("Chart.yaml").exists() || current.join("chart.yaml").exists() {
+        if ["Chart.yaml", "chart.yaml"]
+            .iter()
+            .any(|name| source.read_bytes(&current.join(name)).is_some())
+        {
             return Some(current);
         }
         let parent = current.parent()?;

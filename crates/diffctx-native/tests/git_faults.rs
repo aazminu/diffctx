@@ -22,6 +22,12 @@ const TIMEOUT_SECS: u64 = 3;
 /// Deadline plus the cleanup allowance, plus process start-up on a loaded CI
 /// runner; a hang is minutes, so the margin cannot hide one.
 const BOUND: Duration = Duration::from_secs(TIMEOUT_SECS + 2 + 3);
+/// The deadline for runs that must return the whole answer: one the debug
+/// build on a loaded runner never reaches, far short of the 600 s a hang
+/// sleeps. Under the 3 s one, a slow macOS runner cut the true answer short
+/// and the test read the disclosed partial as a changed answer (#502).
+const ANSWER_TIMEOUT_SECS: u64 = 30;
+const ANSWER_BOUND: Duration = Duration::from_secs(ANSWER_TIMEOUT_SECS + 5);
 
 fn real_git() -> String {
     let out = Command::new("sh")
@@ -32,6 +38,7 @@ fn real_git() -> String {
 }
 
 const FAKE_GIT: &str = r#"#!/bin/sh
+echo "$*" >> "$FAKE_GIT_CALLS"
 for a in "$@"; do
   if [ "$a" = "$FAKE_GIT_TARGET" ]; then hit=1; fi
 done
@@ -82,6 +89,7 @@ impl Fixture {
             .env("FAKE_GIT_TARGET", target)
             .env("FAKE_GIT_MODE", mode)
             .env("FAKE_GIT_PIDS", self.pids_file())
+            .env("FAKE_GIT_CALLS", self.tmp.path().join("calls"))
             .env("DIFFCTX_NO_MARKER", "1")
             .output()
             .expect("run diffctx");
@@ -89,7 +97,11 @@ impl Fixture {
     }
 
     fn impact(&self, target: &str, mode: &str) -> (Output, Duration) {
-        let timeout = TIMEOUT_SECS.to_string();
+        self.impact_within(target, mode, TIMEOUT_SECS)
+    }
+
+    fn impact_within(&self, target: &str, mode: &str, secs: u64) -> (Output, Duration) {
+        let timeout = secs.to_string();
         self.run(
             target,
             mode,
@@ -260,8 +272,8 @@ fn a_cat_file_stalled_while_draining_an_oversized_blob_is_bounded() {
 /// is the one the real git gives, not a guess and not a hang.
 fn assert_recovers_the_true_answer(mode: &str) {
     let fx = fixture();
-    let (out, elapsed) = fx.impact("cat-file", mode);
-    assert!(elapsed < BOUND, "{mode}: took {elapsed:?}");
+    let (out, elapsed) = fx.impact_within("cat-file", mode, ANSWER_TIMEOUT_SECS);
+    assert!(elapsed < ANSWER_BOUND, "{mode}: took {elapsed:?}");
     assert!(
         out.status.success(),
         "{mode}: {}",
@@ -297,8 +309,8 @@ fn a_descendant_holding_stdout_cannot_hold_the_run() {
 #[test]
 fn a_flood_on_stderr_neither_deadlocks_nor_changes_the_answer() {
     let fx = fixture();
-    let (out, elapsed) = fx.impact("ls-files", "stderr_flood");
-    assert!(elapsed < BOUND, "took {elapsed:?}");
+    let (out, elapsed) = fx.impact_within("ls-files", "stderr_flood", ANSWER_TIMEOUT_SECS);
+    assert!(elapsed < ANSWER_BOUND, "took {elapsed:?}");
     assert!(
         out.status.success(),
         "{}",
@@ -499,6 +511,134 @@ fn a_deadline_that_found_nothing_names_the_limit_not_a_clean_tree() {
         assert_eq!(out.status.code(), Some(0), "{mode}: {stderr}");
         assert!(stderr.contains("deadline"), "{mode}: {stderr}");
         assert!(!stderr.contains("no semantic context"), "{mode}: {stderr}");
+    }
+    fx.assert_no_survivors();
+}
+
+/// A change with all three kinds of answer impact reads through git: a
+/// caller of a changed definition, a caller of a removed one, and a line
+/// still naming a deleted path.
+fn sweep_fixture() -> Fixture {
+    let fx = fixture();
+    let repo = fx.repo();
+    std::fs::write(
+        repo.join("pricing.py"),
+        "def total(items):\n    return sum(items) * 2\n\n\ndef legacy(items):\n    return items\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("old.py"),
+        "from pricing import legacy\n\n\ndef use_legacy(cart):\n    return legacy(cart)\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.join("scripts")).unwrap();
+    std::fs::write(repo.join("scripts/rotate.sh"), "echo rotate\n").unwrap();
+    std::fs::write(repo.join("ops.md"), "Run scripts/rotate.sh weekly.\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "legacy and the script"]);
+    std::fs::write(
+        repo.join("pricing.py"),
+        "def total(items):\n    return sum(items) * 3\n",
+    )
+    .unwrap();
+    std::fs::remove_file(repo.join("scripts/rotate.sh")).unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "drop legacy and the script"]);
+    // The range is the whole question: a working tree that lost every caller
+    // and gained junk answers it only for a run that read the disk instead
+    // of the snapshot, the way a failed `ls-tree` once did (#443).
+    for gone in ["checkout.py", "old.py", "ops.md"] {
+        std::fs::remove_file(repo.join(gone)).unwrap();
+    }
+    std::fs::write(repo.join("junk.py"), "def total():\n    return 0\n").unwrap();
+    fx
+}
+
+/// What the run claims: the callers of each changed or removed symbol, and
+/// the lines still naming a deleted path.
+fn claims(doc: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = doc["changed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|c| {
+            let symbol = c["symbol"].as_str().unwrap_or("").to_string();
+            c["callers"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(move |k| format!("{symbol} <- {}", k["path"].as_str().unwrap_or("")))
+        })
+        .chain(
+            doc["stale_references"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|r| format!("stale {}", r["path"].as_str().unwrap_or(""))),
+        )
+        .collect();
+    out.sort();
+    out
+}
+
+/// Whether the run said it did not see everything.
+fn disclosed(doc: &serde_json::Value) -> bool {
+    let listed = |k: &str| doc[k].as_array().is_some_and(|a| !a.is_empty());
+    listed("limits") || listed("unanalysed_files") || doc["withheld_files"].as_u64() > Some(0)
+}
+
+/// Every git read impact makes, failed in turn: the answer is an error, a
+/// named loss, or the whole truth, never a smaller answer that looks
+/// complete. A failed `git grep` used to drop the removed definition's
+/// caller and the stale reference with exit 0 and no limit.
+#[test]
+fn every_failing_git_read_is_an_error_or_a_named_loss() {
+    let fx = sweep_fixture();
+    let calls = fx.tmp.path().join("calls");
+    let _ = std::fs::remove_file(&calls);
+    let (out, _) = fx.impact_within("no-such-verb", "fail", ANSWER_TIMEOUT_SECS);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let truth = claims(&json(&out));
+    for expected in ["legacy <- old.py", "stale ops.md", "total <- checkout.py"] {
+        assert!(truth.iter().any(|c| c == expected), "{expected}: {truth:?}");
+    }
+    let log = std::fs::read_to_string(&calls).expect("the fake git logged its calls");
+    let mut verbs: Vec<String> = log
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            while let Some(w) = words.next() {
+                match w {
+                    "-c" | "-C" | "--git-dir" | "--work-tree" => {
+                        words.next();
+                    }
+                    w if w.starts_with('-') => {}
+                    w => return Some(w.to_string()),
+                }
+            }
+            None
+        })
+        .collect();
+    verbs.sort();
+    verbs.dedup();
+    assert!(verbs.iter().any(|v| v == "grep"), "{verbs:?}");
+    for verb in &verbs {
+        let (out, elapsed) = fx.impact(verb, "fail");
+        assert!(elapsed < BOUND, "{verb}: took {elapsed:?}");
+        if !out.status.success() {
+            continue;
+        }
+        let doc = json(&out);
+        assert!(
+            disclosed(&doc) || claims(&doc) == truth,
+            "failing `git {verb}` gave a smaller answer that looks complete: {:?} vs {truth:?}\n{doc:#}",
+            claims(&doc)
+        );
     }
     fx.assert_no_survivors();
 }

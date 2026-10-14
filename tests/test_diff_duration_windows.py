@@ -149,3 +149,14 @@ class TestDurationWindows:
         result = run_diffctx_subprocess([".", "--diff", "1h", "-f", "yaml"], cwd=ancient_repo)
         assert result.returncode == EXIT_EMPTY_DIFF
         assert "widen the window" in result.stderr
+
+    def test_an_empty_range_is_not_called_a_window(self, ancient_repo):
+        """A range resolves to its fork point too; only a duration is phrased
+        as a window. `HEAD..HEAD~1` is empty from the fork, which is git's
+        three-dot reading."""
+        (ancient_repo / "ancient.py").write_text("def ancient():\n    return 'older'\n", encoding="utf-8")
+        _git(ancient_repo, "commit", "-q", "-am", "older", when=_LONG_AGO)
+        result = run_diffctx_subprocess([".", "--diff", "HEAD..HEAD~1", "-f", "yaml"], cwd=ancient_repo)
+        assert result.returncode == EXIT_EMPTY_DIFF
+        assert "widen the window" not in result.stderr
+        assert "git diff --stat HEAD...HEAD~1" in result.stderr

@@ -196,6 +196,15 @@ runs:
         if [ "$shallow" = "true" ] && [ -z "$IN_RANGE" ]; then
           if [ -n "$PR_BASE_SHA" ] && [ -n "$PR_HEAD_SHA" ]; then
             git -C "$IN_PATH" fetch --quiet --no-tags --depth=1 origin "$PR_BASE_SHA" "$PR_HEAD_SHA"
+            # diffctx measures a range from where its head forked off the
+            # base (#485): deepen both sides until git can name that commit.
+            for _ in 1 2 3 4 5 6 7 8; do
+              git -C "$IN_PATH" merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA" >/dev/null 2>&1 && break
+              git -C "$IN_PATH" fetch --quiet --no-tags --deepen=64 origin "$PR_BASE_SHA" "$PR_HEAD_SHA"
+            done
+            git -C "$IN_PATH" merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA" >/dev/null 2>&1 ||
+              echo "::warning::no fork point within 512 commits: $range compares two trees," \
+                "so base-branch commits after the fork read as part of this PR"
           else
             git -C "$IN_PATH" fetch --quiet --no-tags --deepen=1 origin
           fi
