@@ -3,7 +3,7 @@
     "diffctx": {
       "command": "uvx",
       "args": [
-        "diffctx[mcp]==1.19.0",
+        "diffctx[mcp]==1.19.1",
         "mcp"
       ]
     }
