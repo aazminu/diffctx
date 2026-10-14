@@ -75,7 +75,7 @@ else
     log_failure no-uvx
     exit 0
   }
-  launch=(uvx -q --offline "diffctx[mcp]==1.18.4")
+  launch=(uvx -q --offline "diffctx[mcp]==1.19.0")
 fi
 
 # A release without the subcommand, or a cache uv has not filled yet, exits
