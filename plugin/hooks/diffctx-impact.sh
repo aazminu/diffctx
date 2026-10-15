@@ -87,8 +87,9 @@ fi
 
 # A release without the subcommand, or a cache uv has not filled yet, exits
 # non-zero and prints nothing, which is the right answer on the commit path.
-# The plugin's root lets the hook see a newer version installed beside it (#524).
-printf '%s' "$payload" | DIFFCTX_PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-}" "${launch[@]}" "${args[@]}" 2>/dev/null
+# No environment assignment on this line: the plugin directory reads one as
+# a credential forwarded into the package and holds the update (#565).
+printf '%s' "$payload" | "${launch[@]}" "${args[@]}" 2>/dev/null
 status=$?
 [[ $status -eq 0 ]] || log_failure "launch-$status"
 exit 0

@@ -100,6 +100,7 @@ fn hook_in_env(
     let mut child = Command::new(&*BIN)
         .current_dir(repo)
         .env("DIFFCTX_CACHE_DIR", cache)
+        .env_remove("CLAUDE_PLUGIN_ROOT")
         .envs(env.iter().copied())
         .args(["hook", event])
         .args(extra)
@@ -312,7 +313,7 @@ fn an_older_pin_says_once_per_session_that_a_newer_one_is_installed() {
     for dir in [running, "999.0.0", "1000.0", "not-a-version"] {
         std::fs::create_dir_all(plugins.path().join(dir)).unwrap();
     }
-    let env = [("DIFFCTX_PLUGIN_ROOT", root.as_path())];
+    let env = [("CLAUDE_PLUGIN_ROOT", root.as_path())];
     let notice = format!("diffctx 999.0.0 is installed; this session runs {running}.");
     let pre = |session: &str| {
         hook_in_env(
@@ -357,7 +358,7 @@ fn an_older_pin_says_once_per_session_that_a_newer_one_is_installed() {
         cache.path(),
         "pretooluse",
         &[],
-        &[("DIFFCTX_PLUGIN_ROOT", current.as_path())],
+        &[("CLAUDE_PLUGIN_ROOT", current.as_path())],
         &payload_in_session("s3", repo, "git status"),
     );
     assert_eq!(quiet.stdout, "", "nothing newer, nothing said");
