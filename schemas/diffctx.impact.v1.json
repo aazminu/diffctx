@@ -63,6 +63,18 @@
       "format": "uint",
       "minimum": 0
     },
+    "named_by": {
+      "description": "Lines outside the change that name a changed file by its path from\nanother runtime or a config: a command line, a Dockerfile, a\nsettings entry that runs it (#393, #523). Imports are callers.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PathReference"
+      }
+    },
+    "named_by_omitted": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
     "commit_count": {
       "type": "integer",
       "format": "uint",
@@ -212,6 +224,28 @@
         "line",
         "target",
         "kind"
+      ]
+    },
+    "PathReference": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "target": {
+          "description": "The changed file the line names.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "line",
+        "target"
       ]
     },
     "ChangedSymbol": {

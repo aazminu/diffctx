@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The native binary, the Python CLI and the MCP server render the pack
+  artifact and fit it to `--budget` with one engine function, measured on
+  the text each delivers: one range, budget and format gives the same
+  document from each door that serves that format (#507).
+- YAML has one writer for both CLIs. A string a YAML 1.1 reader would take
+  for something else (`off`, `y`, `=`, a date) is quoted, so PyYAML reads a
+  symbol named `off` as a string; the native YAML changes style to match
+  (double quotes where needed, literal blocks). The Python CLI's YAML now
+  carries `commit_count`, `redactions`, an empty `fragments` list and the
+  schema's key order.
+
+### Fixed
+
+- A budget-bound `-f json`/`-f yaml` artifact from the Python CLI was cut by
+  position: production before docs, and the rewrite of a multi-fragment
+  file before its one-line bumps. A changed fragment is now shortened before
+  it is dropped, so a larger budget never shows less of the change (#438).
+- `--with-raw-diff` no longer spends `--budget`: the patch is not charged,
+  as documented, and the selection under a binding budget is the same with
+  and without it.
+
 ## [1.19.1] - 2026-10-14
 
 ### Added

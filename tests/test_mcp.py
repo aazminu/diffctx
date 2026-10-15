@@ -140,7 +140,6 @@ class TestServerIdentity:
             assert tool.annotations.open_world_hint is False, f"{tool.name} is open-world"
 
 
-@pytest.mark.timeout(30)
 class TestGetDiffContext:
     @pytest.mark.asyncio
     async def test_returns_markdown(self, server, mcp_repo):
@@ -560,7 +559,6 @@ class TestBudgetTokensValidation:
         assert "Nothing was returned" in text
 
 
-@pytest.mark.timeout(120)
 class TestTokenBudgetGuardExecutes:
     """The over-budget branch on get_tree_map (:214) and get_file_context
     (:324) decides between returning real content and a refusal notice.
@@ -1040,7 +1038,6 @@ class TestDefaultMode:
         assert "src/main.py" in text
 
 
-@pytest.mark.timeout(60)
 class TestProgressiveDisclosure:
     """The two-call shape #127 collapsed the server onto: rank, then read.
 

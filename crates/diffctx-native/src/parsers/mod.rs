@@ -63,6 +63,7 @@ pub fn unanalysed_text(reason: &str) -> &'static str {
         "parse_timeout" => "parse timed out",
         "parse_partial" => "parsed with errors",
         "too_large" => "over the size cap",
+        "embedded_code" => "its embedded code is not analysed",
         "unreadable" => "could not be read",
         _ => "parse failed",
     }

@@ -245,6 +245,11 @@ jobs:
   rust-diffctx-test:
     name: Rust diffctx tests
     runs-on: ubuntu-latest
+    # tests/git_faults.rs stalls never end on their own (#510): a run its
+    # deadline does not end hangs, and this is where it fails. Green runs
+    # took 12.6 (ubuntu), 21.5 (macos) and 37.9 (windows) minutes on
+    # 38693094541.
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -304,6 +309,10 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # The hang guard of #510. The green Windows cell took 59.9 and 59.1
+    # minutes on 38751976320 and 38770819847 (corpus 2031 s and 2393 s), so
+    # 60 would cut a passing run.
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -368,6 +377,10 @@ jobs:
             python-version: '3.13'
 
     runs-on: ${{ matrix.os }}
+    # The suite's hang guard (#529): no test carries a per-test timeout, whose
+    # Windows thread method os._exit()s the xdist worker mid-test. The slowest
+    # green cell took 10.9 min on 38702211254.
+    timeout-minutes: 30
     permissions:
       contents: read
 
@@ -431,6 +444,16 @@ jobs:
           else
             echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
           fi
+
+      # tests/test_fit_contract.py holds the native binary to the artifact the
+      # Python CLI and the MCP server deliver (#507); one cell builds it, and
+      # without it those cases skip.
+      - name: Build the native binary for the door contract
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        shell: bash
+        run: |
+          cargo build --release --locked --bin diffctx
+          echo "DIFFCTX_NATIVE_BIN=$PWD/target/release/diffctx" >> "$GITHUB_ENV"
 
       - name: Run Tests with Coverage
         shell: bash
