@@ -345,5 +345,5 @@ def test_a_launch_that_fails_leaves_a_line_in_the_hook_log(tmp_path, pending_cha
     assert result.stdout == ""
     line = (tmp_path / "cache" / "diffctx" / "hook.log").read_text().split()
     assert line[2:6] == ["PreToolUse", "-", "-", "error:launch-1"]
-    pin = re.search(r'pin="diffctx\[mcp\]==([0-9.]+)"', IMPACT_SCRIPT.read_text()).group(1)
-    assert line[-1] == pin, "the line names the version that wrote it (#524)"
+    launched = re.search(r'uvx -q --offline "diffctx\[mcp\]==([0-9.]+)"', IMPACT_SCRIPT.read_text()).group(1)
+    assert line[-1] == launched, "the line names the version that wrote it (#524)"

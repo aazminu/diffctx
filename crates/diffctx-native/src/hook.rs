@@ -2505,8 +2505,8 @@ const UPGRADE_NOTICE_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// #524: a session runs the plugin it started with, and a version installed
 /// since sits beside it in the plugin cache. Claude Code exports the plugin's
-/// root to its hooks (`CLAUDE_PLUGIN_ROOT`), and the wrapper must not forward
-/// it under another name (#565); a newer `X.Y.Z` sibling is said once per session.
+/// root to its hooks (`CLAUDE_PLUGIN_ROOT`), so the wrapper forwards nothing;
+/// a newer `X.Y.Z` sibling is said once per session.
 fn upgrade_notice(session: Option<&str>) -> Option<String> {
     let root = PathBuf::from(std::env::var_os("CLAUDE_PLUGIN_ROOT")?);
     let running = env!("CARGO_PKG_VERSION");

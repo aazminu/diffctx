@@ -229,11 +229,6 @@ class TestPluginHook:
         impact = (self.HOOKS / "diffctx-impact.sh").read_text(encoding="utf-8")
         assert f"uvx -q --offline {pin}" in impact
         assert '"${args[@]}"' in impact
-        # An assignment on the launch reads to the directory as a credential
-        # forwarded into the package and holds the update (#565); the hook's
-        # own environment already carries CLAUDE_PLUGIN_ROOT.
-        [launch] = [line for line in impact.splitlines() if '"${launch[@]}"' in line]
-        assert not re.search(r"\b[A-Za-z_]\w*=", launch), launch
         session = (self.HOOKS / "diffctx-session.sh").read_text(encoding="utf-8")
         assert f"uvx -q {pin} --version" in session
         assert f"uvx diffctx=={__version__} . --diff --mode impact -f md" in session

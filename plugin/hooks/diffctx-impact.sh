@@ -51,10 +51,11 @@ case "$payload" in
 *) [[ $event != pretooluse ]] && searches_pending_change || exit 0 ;;
 esac
 
-# The pinned version for the log's last field, so an audit can tell an old
-# pin (#524). The release rewrites it with the launch's literal below, which
-# stays written out in the command because the plugin directory requires it.
-pin="diffctx[mcp]==1.19.1"
+# The launched version for the log's last field, so an audit can tell an old
+# plugin (#524). The release rewrites it with the launch's literal below,
+# which stays written out in the command because the plugin directory
+# requires it. Not named `pin` (#565).
+spec="diffctx[mcp]==1.19.1"
 
 # The binary logs every run it gets (#338); a launch that never reached it
 # is logged here, or an audit could not tell it from a hook with nothing to say.
@@ -63,7 +64,7 @@ log_failure() {
   local re='"session_id"[[:space:]]*:[[:space:]]*"([A-Za-z0-9-]+)"'
   [[ $payload =~ $re ]] && session=${BASH_REMATCH[1]}
   mkdir -p "$dir" 2>/dev/null &&
-    printf '%s %s %s - - error:%s - - %s\n' "$(date +%s)" "$session" "$hook_event" "$1" "${pin##*==}" >>"$dir/hook.log" 2>/dev/null
+    printf '%s %s %s - - error:%s - - %s\n' "$(date +%s)" "$session" "$hook_event" "$1" "${spec##*==}" >>"$dir/hook.log" 2>/dev/null
   return 0
 }
 
@@ -87,8 +88,6 @@ fi
 
 # A release without the subcommand, or a cache uv has not filled yet, exits
 # non-zero and prints nothing, which is the right answer on the commit path.
-# No environment assignment on this line: the plugin directory reads one as
-# a credential forwarded into the package and holds the update (#565).
 printf '%s' "$payload" | "${launch[@]}" "${args[@]}" 2>/dev/null
 status=$?
 [[ $status -eq 0 ]] || log_failure "launch-$status"

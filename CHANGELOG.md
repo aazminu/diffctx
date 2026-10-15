@@ -30,9 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as documented, and the selection under a binding budget is the same with
   and without it.
 - The plugin's hook launches the pinned package with no environment
-  assignment; `diffctx hook` reads the `CLAUDE_PLUGIN_ROOT` Claude Code
-  already exports. The plugin directory had held every update since as a
-  credential forwarded into the package (#565).
+  assignment, since `diffctx hook` reads the `CLAUDE_PLUGIN_ROOT` Claude
+  Code already exports, and its version variable is no longer named `pin`.
+  The plugin directory has flagged every main-branch plugin since the change
+  that introduced both as reading a credential (#565).
 
 ## [1.19.1] - 2026-10-14
 
