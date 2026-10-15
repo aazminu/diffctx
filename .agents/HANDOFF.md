@@ -21,7 +21,7 @@ runs under the coordinator session `nikolay-2f`:
 | commit | what | gate (red on the base head, green after) |
 |---|---|---|
 | `550dfd6a` | #527: a recording line is answered from git's record; a search on the same line answers only when nothing landed | `a_commit_line_that_then_greps_its_log_is_still_reviewed` (red on 97d6bf57) |
-| `f0d5a170` | #524: an older plugin pin says once per session that a newer version is installed beside it (`DIFFCTX_PLUGIN_ROOT` from the wrapper); every `hook.log` line ends with its version | `an_older_pin_says_once_per_session_that_a_newer_one_is_installed`; `test_a_session_on_an_older_plugin_hears_once_…` under /bin/bash 3.2 and bash 5 |
+| `f0d5a170` | #524: an older plugin pin says once per session that a newer version is installed beside it (the hook reads the `CLAUDE_PLUGIN_ROOT` Claude Code exports; the wrapper's `DIFFCTX_PLUGIN_ROOT` forward was removed in `2dec13a5`, #565); every `hook.log` line ends with its version | `an_older_pin_says_once_per_session_that_a_newer_one_is_installed`; `test_a_session_on_an_older_plugin_hears_once_…` under /bin/bash 3.2 and bash 5 |
 | `2609f714` | #529 diagnosis: Windows tests run with `RUST_BACKTRACE` and `PYTHONFAULTHANDLER`; on failure a pwsh step reruns `--lf` in one process and prints the 32-bit exit code | diagnostic only |
 | `c5d59f74` | #529 diagnosis: WER LocalDumps for python.exe, the Application Error events printed on failure, minidumps uploaded as `crash-dumps-<os>-py<ver>` | diagnostic only |
 | `9c56595b` | #532: a line whose last command fails (PostToolUseFailure) is reviewed like any other; `diffctx hook posttoolusefailure` | `test_a_commit_line_that_ends_in_a_failing_command_is_still_reviewed` (both bashes), manifest test (red on c5d59f74) |
