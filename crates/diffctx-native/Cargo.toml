@@ -91,7 +91,7 @@ tree-sitter-swift = { version = "0.7", optional = true }
 # The fwcd grammar (fwcd's own crate stops at 0.3.8, pinned to tree-sitter
 # < 0.23, fwcd#242), as BrokkAi publishes its maintained fork with symbol-
 # prefixed C exports. Exact pin: a fork's next release is reviewed, not taken.
-# On yay-tsa's 1,036 files it lost no type declaration and broke on none;
+# On a 1,036-file Kotlin codebase it lost no type declaration and broke on none;
 # tree-sitter-kotlin-sg 0.4.1 silently dropped 7 classes (a bodyless
 # annotated class swallowed the next one) and broke 5 Compose files, and
 # tree-sitter-kotlin-ng dropped 8 and broke whole classes on `get(...)`.

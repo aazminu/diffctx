@@ -1,7 +1,9 @@
 import re
 import subprocess
+import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -43,6 +45,10 @@ def test_every_rust_suite_runs_in_the_pre_commit_hook():
     assert not _missing(hooks[0]["entry"]), sorted(_missing(hooks[0]["entry"]))
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the stand-in cargo is a POSIX script on a POSIX PATH; the Windows Rust job runs the script itself",
+)
 def test_the_suites_script_reads_every_suite_off_the_tree(tmp_path):
     """The script's own enumeration, run against a stand-in cargo."""
     fake = tmp_path / "cargo"
