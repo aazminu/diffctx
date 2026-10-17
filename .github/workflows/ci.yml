@@ -278,26 +278,9 @@ jobs:
       # a regression in ANY case fails the build. A limit still works locally
       # for a fast stratified subset.
       - name: Build and test
-        working-directory: crates/diffctx-native
         run: |
-          # --features python or analytics/, graph_export/ and project_graph/
-          # are not compiled at all: they are cfg-gated on that feature, ship
-          # inside the wheel, and their 19 inline tests ran in no job until
-          # 2026-09-06 — `cargo test --lib` reported a confident green over a
-          # library that did not contain them.
-          cargo test --lib --features python
-          cargo test --test native_cli
-          cargo test --test fragment_snapshot
-          # The binary-level suites: impact, the hook, bindings, staged
-          # snapshots, git failures. They ran in no job until 2026-10-11, so
-          # their regression tests (#387 among them) guarded nothing.
-          # --no-fail-fast: one failing suite must not hide the others.
-          cargo test --no-fail-fast --test impact --test hook --test bindings --test staged \
-            --test git_faults --test in_memory --test context_schema --test kotlin
-          cargo build --release --examples
-          # --release, the profile the wheel ships: it unwinds, so the corpus
-          # exercises the same panic strategy production runs under.
-          cargo test --release --test yaml_cases
+          (cd crates/diffctx-native && cargo build --release --examples)
+          scripts/cargo-test-suites.sh
 
   # The Linux job above keeps its name because branch protection requires it;
   # this one gates the same suites where paths, line endings and process
@@ -334,15 +317,8 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-
 
       - name: Build and test
-        working-directory: crates/diffctx-native
         shell: bash
-        run: |
-          cargo test --lib --features python
-          cargo test --test native_cli
-          cargo test --test fragment_snapshot
-          cargo test --no-fail-fast --test impact --test hook --test bindings --test staged \
-            --test git_faults --test in_memory --test context_schema --test kotlin
-          cargo test --release --test yaml_cases
+        run: scripts/cargo-test-suites.sh
 
       # Release ships an Intel-Mac binary cross-built on this arm64 image; the
       # first build of it must not be the release itself.
