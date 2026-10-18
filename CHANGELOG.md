@@ -86,6 +86,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The plugin directory has flagged every main-branch plugin since the change
   that introduced both as reading a credential; whether this clears the
   finding is read off the next directory scan (#565).
+- "Review my last commit" with the plugin loaded never reached impact: the
+  review skill asked only for the code (`pack`), and the session context
+  named only commit and push. The skill now asks for impact first, and the
+  session context names the review route. On the plugin's review eval, runs
+  with the plugin reach impact 3 of 3 times, up from 0 (#551).
+- The weekly channel check names every release tag that `main` does not
+  reach and every tag whose release is missing or a draft: a consumer pins
+  the commit a tag first named, and a moved tag strands it (#500).
 
 ## [1.19.1] - 2026-10-14
 

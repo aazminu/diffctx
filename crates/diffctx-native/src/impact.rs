@@ -1625,7 +1625,7 @@ fn dispatch_route(state: &ScoredState, core: &Fragment, file: &[&Fragment]) -> O
     let supers = enclosing_class(core, file)
         .map(|c| supertypes(&c.content, &ext))
         .unwrap_or_default();
-    let quoted = || format!("`{}`", supers.join("`, `"));
+    let quoted = || format!("`{}`", supers[..supers.len().min(2)].join("`, `"));
     if words.iter().any(|w| matches!(*w, "@Override" | "override")) {
         return Some(if supers.is_empty() {
             "the supertype it overrides".to_string()
@@ -1640,7 +1640,7 @@ fn dispatch_route(state: &ScoredState, core: &Fragment, file: &[&Fragment]) -> O
 /// `implements` and `with` clauses, a Python base list, a Kotlin, Swift or
 /// C# `: Base` after the primary constructor. The root types every class
 /// has are not routes.
-fn supertypes(class: &str, ext: &str) -> Vec<String> {
+pub(crate) fn supertypes(class: &str, ext: &str) -> Vec<String> {
     let Some(at) = class.find("class ") else {
         return Vec::new();
     };
@@ -1690,8 +1690,9 @@ fn supertypes(class: &str, ext: &str) -> Vec<String> {
                     .next()
                     .is_some_and(|c| c.is_alphabetic() || c == '_')
         })
+        .map(|t| t.split(['[', '<', '(']).next().unwrap_or(t))
+        .filter(|t| !t.is_empty())
         .map(|t| t.rsplit('.').next().unwrap_or(t).to_string())
-        .take(2)
         .collect()
 }
 

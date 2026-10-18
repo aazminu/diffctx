@@ -533,7 +533,11 @@ impl Resolver<'_> {
             if own == class && site.path == def.path {
                 return Evidence::Resolved;
             }
-            return bases_of(header)
+            let ext = std::path::Path::new(site.path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            return crate::impact::supertypes(header, ext)
                 .iter()
                 .map(|b| self.names(site, b, def.path, class))
                 .fold(Evidence::Rejected, Evidence::best);
@@ -824,27 +828,6 @@ pub(crate) fn absorb(
     if !f.lines.contains(&line) {
         f.lines.push(line);
     }
-}
-
-static CLASS_HEADER: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
-        r"class\s+[\w$]+\s*(?:\(([^)]*)\)|extends\s+([\w$.]+)(?:\s+implements\s+([\w$.,\s]+))?)",
-    )
-    .unwrap()
-});
-
-fn bases_of(header: &str) -> Vec<String> {
-    let Some(c) = CLASS_HEADER.captures(header) else {
-        return Vec::new();
-    };
-    [c.get(1), c.get(2), c.get(3)]
-        .into_iter()
-        .flatten()
-        .flat_map(|m| m.as_str().split(','))
-        .map(|b| b.trim().split(['[', '<', '(']).next().unwrap_or("").trim())
-        .filter(|b| !b.is_empty() && !b.contains('='))
-        .map(|b| b.rsplit('.').next().unwrap_or(b).to_string())
-        .collect()
 }
 
 /// `x = Bot(...)`, `const x = new Bot(...)`, `with Bot(...) as x`: the
