@@ -1749,25 +1749,25 @@ fn wrapped_spans(command: &str) -> Vec<(usize, usize)> {
                 }
                 j += 1;
             }
-            spans.push((i, j));
+            spans.push((i + 2, j));
         } else if bytes[i] == b'`' {
             let end = command[i + 1..]
                 .find('`')
                 .map_or(bytes.len(), |k| i + 1 + k);
-            spans.push((i, end));
+            spans.push((i + 1, end));
             i = end;
         } else if bytes[i..].starts_with(b"eval ") {
             let end = command[i..]
                 .find(['\n', ';', '&', '|'])
                 .map_or(bytes.len(), |k| i + k);
-            spans.push((i, end));
+            spans.push((i + 5, end));
         } else if let Some(open) = shell_c_flag(&bytes[i..]) {
             // `-c`, and clusters ending in it (`-lc`, `-ic`): `bash -lc "…"`.
             let quote = bytes[i + open] as char;
             let end = command[i + open + 1..]
                 .find(quote)
                 .map_or(bytes.len(), |k| i + open + 1 + k);
-            spans.push((i, end));
+            spans.push((i + open + 1, end));
         }
         i += 1;
     }
@@ -2269,7 +2269,7 @@ fn decide(
     let command = payload["tool_input"]["command"]
         .as_str()
         .unwrap_or_default();
-    let recording = names_a_recording_verb(command);
+    let recording = names_a_recording_verb(command) || hides_git(command);
     let search = if matches!(event, Event::PostToolUse { .. }) {
         searched(&payload)
     } else {
@@ -2431,9 +2431,9 @@ fn not_analysed(event: Event, why: Silence, trace: &mut Trace) -> String {
 }
 
 fn names_a_recording_verb(command: &str) -> bool {
-    let words = || command.split(|c: char| !(c.is_alphanumeric() || c == '-'));
-    words().any(|w| w == "git")
-        && words().any(|w| matches!(w, "commit" | "push" | "merge" | "cherry-pick" | "revert"))
+    statements(command)
+        .iter()
+        .any(|st| RECORDING_VERBS.contains(&st.verb.as_str()))
 }
 
 /// The log is cut over to `hook.log.1` past this size: tens of thousands of
@@ -2843,6 +2843,15 @@ mod tests {
         assert!(hides_git("eval git push"));
         assert!(!hides_git("FP=$(cat f) && git commit -m x"));
         assert!(!hides_git("git commit -m 'a `b`' && echo $(date)"));
+        for command in [
+            "git rev-parse HEAD; gh api repos/o/r/commits/abc --jq '.commit.author.date'",
+            "git merge-base main HEAD; gh pr comment 1 -b 'please commit or push'",
+            "git status; grep -rn 'git commit' src/",
+            "git log -1 --grep=commit",
+        ] {
+            assert!(!names_a_recording_verb(command), "{command}");
+            assert!(!hides_git(command), "{command}");
+        }
     }
 
     #[test]
