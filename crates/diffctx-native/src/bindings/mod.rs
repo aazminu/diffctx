@@ -162,7 +162,10 @@ impl<'a> Resolver<'a> {
             .unwrap_or_default();
         let b = Rc::new(match lang_of(path) {
             Some(Lang::Python) => python_bindings(&text),
-            Some(Lang::Js) => js_bindings(&text),
+            Some(Lang::Js) => {
+                let embedded = crate::parsers::embedded_script_source(path, &text);
+                js_bindings(embedded.as_ref().map_or(text.as_str(), |(_, s)| s.as_str()))
+            }
             None => FileBindings::default(),
         });
         self.cache.borrow_mut().insert(path.to_string(), b.clone());

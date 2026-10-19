@@ -1762,7 +1762,6 @@ fn collect_embedded_scripts(
     }
 }
 
-
 #[cfg(test)]
 mod grammar_tests {
     use super::*;
