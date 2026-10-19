@@ -1402,7 +1402,7 @@ impl<'a> TestIndex<'a> {
     fn tested_by(
         &self,
         caller: &'a Fragment,
-        state: &ScoredState,
+        state: &'a ScoredState,
         by_id: &FxHashMap<&FragmentId, &'a Fragment>,
         link: &Link,
     ) -> Option<(String, Option<String>)> {
@@ -1419,10 +1419,30 @@ impl<'a> TestIndex<'a> {
     fn walk_up(
         &self,
         caller: &'a Fragment,
-        state: &ScoredState,
+        state: &'a ScoredState,
         by_id: &FxHashMap<&FragmentId, &'a Fragment>,
         link: &Link,
     ) -> Option<(String, Option<String>)> {
+        let lift = |frag: &'a Fragment| -> &'a Fragment {
+            let Some(sym) = frag.symbol_name.as_deref().filter(|s| s.contains('[')) else {
+                return frag;
+            };
+            let base = base_symbol(sym);
+            state
+                .all_fragments
+                .iter()
+                .filter(|f| {
+                    f.path() == frag.path()
+                        && f.id != frag.id
+                        && f.kind.is_definition_kind()
+                        && f.symbol_name.as_deref() == Some(base)
+                        && f.start_line() <= frag.start_line()
+                        && f.end_line() >= frag.end_line()
+                })
+                .min_by_key(|f| f.line_count())
+                .unwrap_or(frag)
+        };
+        let caller = lift(caller);
         if let Some(test) = self.direct(caller, link) {
             return Some((test, None));
         }
@@ -1438,11 +1458,14 @@ impl<'a> TestIndex<'a> {
                     {
                         return;
                     }
-                    let Some(up) = by_id.get(src).copied() else {
+                    let Some(raw_up) = by_id.get(src).copied() else {
                         return;
                     };
-                    if link(up, f) && seen.insert(&up.id) {
-                        next.push(up);
+                    if link(raw_up, f) {
+                        let up = lift(raw_up);
+                        if seen.insert(&up.id) {
+                            next.push(up);
+                        }
                     }
                 });
             }
@@ -1494,6 +1517,7 @@ fn merge_by_symbol(callers: Vec<Caller>) -> Vec<Caller> {
                 .into_iter()
                 .collect();
         }
+        c.symbol = c.symbol.as_deref().map(|s| base_symbol(s).to_string());
         let same = |m: &&mut Caller| {
             m.path == c.path
                 && m.evidence == c.evidence
@@ -2872,7 +2896,13 @@ pub fn build_impact(
             let anonymous =
                 source.0.kind == FragmentKind::Function && source.0.symbol_name.is_none();
             let field = source.0.kind == FragmentKind::Property;
-            if source.0.kind != FragmentKind::Variable && !anonymous && !field {
+            let sub_chunk = source.0.kind == FragmentKind::Chunk
+                && source
+                    .0
+                    .symbol_name
+                    .as_deref()
+                    .is_some_and(|s| s.contains('['));
+            if source.0.kind != FragmentKind::Variable && !anonymous && !field && !sub_chunk {
                 continue;
             }
             let enclosing = file_of(source.0)
@@ -2880,8 +2910,12 @@ pub fn build_impact(
                 .filter(|f| {
                     (f.kind == FragmentKind::Function
                         || (anonymous && f.kind == FragmentKind::Variable)
-                        || (field && f.kind.is_container()))
+                        || ((field || sub_chunk) && f.kind.is_container()))
                         && f.symbol_name.is_some()
+                        && (!sub_chunk
+                            || f.symbol_name.as_deref()
+                                == source.0.symbol_name.as_deref().map(base_symbol))
+                        && !within(&core.id, f)
                         && f.id != source.0.id
                         && f.start_line() <= source.0.start_line()
                         && f.end_line() >= source.0.end_line()
@@ -2904,12 +2938,30 @@ pub fn build_impact(
                 dropped
             );
         }
-        let weights: FxHashMap<&FragmentId, f64> =
-            sources.iter().map(|(f, w, _)| (&f.id, *w)).collect();
-        let findings: FxHashMap<&FragmentId, Finding> = sources
-            .iter()
-            .filter_map(|(f, _, finding)| finding.clone().map(|x| (&f.id, x)))
-            .collect();
+        let mut weights: FxHashMap<&FragmentId, f64> = FxHashMap::default();
+        let mut findings: FxHashMap<&FragmentId, Finding> = FxHashMap::default();
+        for (f, w, finding) in &sources {
+            weights
+                .entry(&f.id)
+                .and_modify(|prev| *prev = prev.max(*w))
+                .or_insert(*w);
+            if let Some(found) = finding {
+                findings
+                    .entry(&f.id)
+                    .and_modify(|prev| {
+                        if matches!(found.evidence, Evidence::Resolved) {
+                            prev.evidence = found.evidence;
+                        }
+                        if found.relation == Relation::Call {
+                            prev.relation = Relation::Call;
+                        }
+                        prev.lines.extend_from_slice(&found.lines);
+                        prev.lines.sort_unstable();
+                        prev.lines.dedup();
+                    })
+                    .or_insert_with(|| found.clone());
+            }
+        }
         // A name match links an import line too, at the import weight; the
         // function that makes the call is the caller, the import is how it got
         // the name. A binding finding skips import lines, so the module-level
