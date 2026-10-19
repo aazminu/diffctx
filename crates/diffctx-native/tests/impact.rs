@@ -4195,7 +4195,8 @@ fn a_local_closure_named_like_a_definition_is_no_caller() {
 /// variable, or a word inside a multiline docstring has no remaining callers.
 #[test]
 fn a_removed_function_is_not_linked_to_a_parameter_or_docstring_word() {
-    let head_doc = "\"\"\"Evaluation helpers.\n\nSplits audio into regions and scores alignment.\n\"\"\"\n";
+    let head_doc =
+        "\"\"\"Evaluation helpers.\n\nSplits audio into regions and scores alignment.\n\"\"\"\n";
     let base_eval = format!(
         "{head_doc}\ndef utterances(run_dir):\n    return [run_dir]\n\n\ndef regions(session):\n    return [session]\n\n\ndef score_wer(hyp, ref):\n    return len(hyp) - len(ref)\n\n\ndef align(reference, utterances):\n    return (reference, utterances)\n\n\ndef summarize(session):\n    regions = []\n    return regions\n\n\ndef evaluate(hyp, ref):\n    return score_wer(hyp, ref)\n"
     );
