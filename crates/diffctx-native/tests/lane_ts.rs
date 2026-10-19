@@ -443,3 +443,29 @@ fn a_vite_alias_resolves_to_the_file_it_names() {
         "{evidence:?}"
     );
 }
+
+/// #577: a call at the top level of an inline `<script>` in HTML is a caller
+/// at its script line range (`page.html:7-7`), both when it is the only caller
+/// and alongside a named function in the same `<script>`.
+#[test]
+fn inline_html_script_top_level_and_function_calls_are_callers() {
+    let only_top_level = "<!doctype html>\n<html>\n<script>\nfunction record(n) {\n  return n + 1;\n}\nrecord(1);\n</script>\n<p>record(99)</p>\n</html>\n";
+    let both = "<!doctype html>\n<html>\n<script>\nfunction record(n) {\n  return n + 1;\n}\nrecord(1);\nfunction restore() {\n  // record(88)\n  const s = 'record(77)';\n  return record(2);\n}\n</script>\n</html>\n";
+    let tmp = repo(
+        &[("only.html", only_top_level), ("both.html", both)],
+        &[],
+    );
+
+    let out_only = symbol(tmp.path(), "only.html:record");
+    assert_eq!(
+        callers(&out_only, "only.html", "record"),
+        set(&["call only.html:7-7"])
+    );
+
+    let out_both = symbol(tmp.path(), "both.html:record");
+    assert_eq!(
+        callers(&out_both, "both.html", "record"),
+        set(&["call both.html:7-7", "call both.html::restore"])
+    );
+}
+

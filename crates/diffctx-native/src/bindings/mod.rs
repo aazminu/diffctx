@@ -35,7 +35,8 @@ pub fn lang_of(path: &str) -> Option<Lang> {
         .map(str::to_ascii_lowercase)?;
     match ext.as_str() {
         "py" | "pyi" => Some(Lang::Python),
-        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts" => Some(Lang::Js),
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts" | "html" | "htm" | "vue"
+        | "svelte" => Some(Lang::Js),
         _ => None,
     }
 }

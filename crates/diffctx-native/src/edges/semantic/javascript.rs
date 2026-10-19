@@ -17,9 +17,9 @@ use crate::types::{Fragment, FragmentId};
 use super::super::EdgeDict;
 use super::super::base::{self, EdgeBuilder};
 
-// Single-file components carry their imports in a `<script>` block, so their
-// dependencies are JavaScript dependencies too.
-const SFC_EXTENSIONS: [&str; 2] = [".vue", ".svelte"];
+// Single-file components and HTML pages carry their scripts in a `<script>`
+// block, so their dependencies and calls are JavaScript dependencies too.
+const SFC_EXTENSIONS: [&str; 4] = [".vue", ".svelte", ".html", ".htm"];
 
 fn is_js_file(path: &Path) -> bool {
     let ext = base::file_ext(path);

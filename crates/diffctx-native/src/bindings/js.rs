@@ -750,8 +750,13 @@ const FUNCTIONS: &[&str] = &[
 ];
 
 pub(super) fn js_facts(path: &str, text: &str) -> Option<JsFacts> {
-    let tree = crate::parsers::parse_tree(grammar_of(path), text)?;
-    let bytes = text.as_bytes();
+    let embedded = crate::parsers::embedded_script_source(path, text);
+    let (grammar, source) = match &embedded {
+        Some((g, s)) => (*g, s.as_str()),
+        None => (grammar_of(path), text),
+    };
+    let tree = crate::parsers::parse_tree(grammar, source)?;
+    let bytes = source.as_bytes();
     let mut scopes: Vec<Scope> = vec![(None, FxHashMap::default())];
     let mut declared: FxHashSet<usize> = FxHashSet::default();
     let mut found: Vec<(tree_sitter::Node, usize)> = Vec::new();

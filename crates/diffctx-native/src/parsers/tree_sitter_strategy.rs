@@ -1673,7 +1673,18 @@ fn fragment_embedded_source(
     let snippet_lines: Vec<&str> = snippet.split('\n').collect();
     let mut walk = Walk::new(snippet.as_bytes(), path, &snippet_lines, config);
     walk.extract_definitions(&tree.root_node(), 0);
-    let embedded = walk.fragments;
+    let Walk {
+        fragments: mut embedded,
+        covered,
+        ..
+    } = walk;
+    if ts_name != "css" {
+        embedded.extend(create_code_gap_fragments(
+            Arc::clone(path),
+            &snippet_lines,
+            &covered,
+        ));
+    }
 
     // Fragment lines are 1-based within the snippet; the snippet's line 1 is
     // the raw_text node's start line in the file.
@@ -1693,6 +1704,64 @@ fn fragment_embedded_source(
         });
     }
 }
+
+/// For HTML and single-file components (`.html`, `.htm`, `.vue`, `.svelte`),
+/// returns `(grammar, script_only_source)` with every byte outside a
+/// JavaScript/TypeScript `<script>` element's `raw_text` blanked to spaces
+/// (`\n` preserved), so the script grammar reads embedded code at its exact
+/// file lines and columns (#577).
+pub(crate) fn embedded_script_source(path: &str, content: &str) -> Option<(&'static str, String)> {
+    let config = find_lang_config_for(path, content)?;
+    if !matches!(config.ts_name, "html" | "svelte") {
+        return None;
+    }
+    let tree = parse_tree(config.ts_name, content)?;
+    let source = content.as_bytes();
+    let mut out: Vec<u8> = source
+        .iter()
+        .map(|&b| if b == b'\n' { b'\n' } else { b' ' })
+        .collect();
+    let mut grammar = "javascript";
+    collect_embedded_scripts(&tree.root_node(), source, &mut out, &mut grammar, 0);
+    Some((grammar, String::from_utf8(out).ok()?))
+}
+
+fn collect_embedded_scripts(
+    node: &Node,
+    source: &[u8],
+    out: &mut [u8],
+    grammar: &mut &'static str,
+    depth: u32,
+) {
+    if depth > PARSERS.max_recursion_depth {
+        return;
+    }
+    if node.kind() == "script_element" && script_is_javascript(node, source) {
+        let g = script_grammar(node, source);
+        if g != "javascript" {
+            *grammar = g;
+        }
+        for i in 0..node.child_count() {
+            let Some(child) = node.child(i) else { continue };
+            if child.kind() == "raw_text" {
+                let range = child.byte_range();
+                if range.end <= out.len() && range.end <= source.len() {
+                    out[range.clone()].copy_from_slice(&source[range.clone()]);
+                    if range.end < out.len() && out[range.end] == b' ' {
+                        out[range.end] = b';';
+                    }
+                }
+            }
+        }
+        return;
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_embedded_scripts(&child, source, out, grammar, depth + 1);
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod grammar_tests {
@@ -2413,6 +2482,21 @@ mod injection_tests {
                 .iter()
                 .any(|f| f.symbol_name.as_deref() == Some("legacyJs")),
             "charset parameter after ';' must not degrade the script to raw lines"
+        );
+    }
+
+    #[test]
+    fn inline_script_top_level_statements_become_chunk_fragments() {
+        let content = "<!doctype html>\n<html>\n<script>\nfunction record(n) {\n  return n + 1;\n}\nrecord(1);\n</script>\n</html>\n";
+        let frags = TreeSitterStrategy::new().fragment(Arc::from("page.html"), content);
+        assert!(
+            frags.iter().any(|f| {
+                f.kind == FragmentKind::Chunk
+                    && f.id.start_line == 7
+                    && f.id.end_line == 7
+                    && f.content.contains("record(1)")
+            }),
+            "top-level statement inside <script> must surface as its own chunk fragment at file line 7"
         );
     }
 }
