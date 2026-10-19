@@ -770,8 +770,7 @@ fn a_caller_in_a_sub_fragment_of_a_long_function_keeps_its_test_link() {
         .unwrap_or_else(|| panic!("expected processA caller, not a sub-fragment: {doc:#}"));
     assert_eq!(proc_a["lines"], "6-49", "{doc:#}");
     assert_eq!(
-        proc_a["tested_by"],
-        "src/test/kotlin/demo/WorkerTest.kt",
+        proc_a["tested_by"], "src/test/kotlin/demo/WorkerTest.kt",
         "{doc:#}"
     );
     assert_eq!(proc_a["tested_via"], "run", "{doc:#}");
