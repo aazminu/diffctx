@@ -258,17 +258,26 @@ pub struct Finding {
 const MAX_REEXPORT_DEPTH: usize = 3;
 
 /// The head of a declaration whose parentheses hold parameters: `def f(`,
-/// `function f(`, a method `name(` opening a body, an arrow `= (…) =>`.
+/// `function f(`, `fn f(`, `func f(`, a method `name(` opening a body, an
+/// arrow `= (…) =>`.
 static DECLARED_PARAMS: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"^\s*(?:(?:export|default|public|private|protected|static|async|get|set|override)\s+)*(?:(?:def|function)\s*\*?\s*[\w$]*\s*\(|[\w$]+\s*\((?:[^()]*)\)\s*(?::[^{=]*)?\{|(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s*)?\()",
+        r"^\s*(?:(?:export|default|public|private|protected|static|async|get|set|override|pub(?:\s*\([^)]*\))?)\s+)*(?:(?:def|function|fn|func)\s*\*?\s*[\w$]*(?:\s*<[^>]*>)?\s*\(|[\w$]+\s*\((?:[^()]*)\)\s*(?::[^{=]*)?\{|(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s*)?\()",
     )
     .unwrap()
 });
 
 /// The parameter names of a fragment's own declaration.
-fn params_of(content: &str) -> FxHashSet<String> {
-    let head: String = content.lines().take(8).collect::<Vec<_>>().join(" ");
+pub(crate) fn params_of(content: &str) -> FxHashSet<String> {
+    let head: String = content
+        .lines()
+        .skip_while(|l| {
+            let t = l.trim_start();
+            t.is_empty() || t.starts_with('@') || t.starts_with("#[")
+        })
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" ");
     let Some(found) = DECLARED_PARAMS.find(&head) else {
         return FxHashSet::default();
     };
@@ -314,7 +323,7 @@ fn params_of(content: &str) -> FxHashSet<String> {
         .collect()
 }
 
-fn assigns(content: &str, name: &str) -> bool {
+pub(crate) fn assigns(content: &str, name: &str) -> bool {
     content.lines().skip(1).any(|line| {
         let t = line.trim_start();
         let t = t

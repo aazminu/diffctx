@@ -3551,6 +3551,7 @@ fn removed_definitions(
         }
     }
     let holders = definition_holders(state);
+    let mut masked_files: FxHashMap<String, Option<Vec<String>>> = FxHashMap::default();
     let mut out = Vec::new();
     for (name, path_removed, (path_at_base, lines), exported, container) in removed {
         if !state.run.check() {
@@ -3641,23 +3642,30 @@ fn removed_definitions(
                     continue;
                 }
             }
-            let code = code_text(&path, &text);
+            // Blank comments and multiline string literals across the whole
+            // file (#536): a single-line grep hit inside a module docstring
+            // carries no quotes of its own and read as code.
+            let code = masked_files
+                .entry(path.clone())
+                .or_insert_with(|| {
+                    state
+                        .run
+                        .source()
+                        .read_to_string(&state.root_dir.join(&path))
+                        .map(|full| {
+                            code_text(&path, &full)
+                                .lines()
+                                .map(str::to_string)
+                                .collect()
+                        })
+                })
+                .as_ref()
+                .and_then(|lines| lines.get(line.saturating_sub(1) as usize).cloned())
+                .unwrap_or_else(|| code_text(&path, &text).to_string());
             // The import is where the name was taken, not a use (#450).
             if bindings::is_import_line(&code) {
                 continue;
             }
-            let bytes = code.as_bytes();
-            let Some(at) = code
-                .match_indices(name.as_str())
-                .map(|(at, _)| at)
-                .find(|&at| {
-                    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
-                    !at.checked_sub(1).is_some_and(|i| word(bytes[i]))
-                        && !bytes.get(at + name.len()).copied().is_some_and(word)
-                })
-            else {
-                continue;
-            };
             let holder = holders
                 .get(&path)
                 .into_iter()
@@ -3674,6 +3682,30 @@ fn removed_definitions(
             }) {
                 continue;
             }
+            // A parameter or local of the enclosing function shadows the
+            // removed name on every unqualified mention inside it (#536).
+            let shadowed_in_holder = holder.is_some_and(|f| {
+                let hc = code_text(&path, &f.content);
+                bindings::params_of(&hc).contains(name.as_str())
+                    || bindings::assigns(&hc, name.as_str())
+                    || binds_locally(&hc, name.as_str())
+            });
+            let bytes = code.as_bytes();
+            let Some(at) = code
+                .match_indices(name.as_str())
+                .map(|(at, _)| at)
+                .find(|&at| {
+                    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+                    let whole_word = !at.checked_sub(1).is_some_and(|i| word(bytes[i]))
+                        && !bytes.get(at + name.len()).copied().is_some_and(word);
+                    let qualified = receiver_before(&code, at).is_some()
+                        || (lang::rust::is_rust(&path)
+                            && lang::rust::path_qualifier(&code[..at]).is_some());
+                    whole_word && !(shadowed_in_holder && !qualified)
+                })
+            else {
+                continue;
+            };
             let next = code[at + name.len()..].trim_start();
             callers.push(Caller {
                 path: path.clone(),
